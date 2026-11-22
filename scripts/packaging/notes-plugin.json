@@ -1,0 +1,20 @@
+{
+  "id": "notes",
+  "kind": "ui",
+  "version": "0.2.0",
+  "protocol": 1,
+  "min_host": "0.9.597",
+  "entry": { "path": "bin/pingloss-notes" },
+  "capabilities": [],
+  "permissions": ["history.read", "folders.read", "clipboard.write", "filesystem.write:folders"],
+  "operations": [
+    { "id": "folders.snapshot", "title": "推送文件夹快照" },
+    { "id": "notes.open", "title": "打开笔记" },
+    { "id": "notes.list", "title": "列出笔记" },
+    { "id": "note.new", "title": "新建笔记" },
+    { "id": "notes.rename", "title": "重命名笔记" },
+    { "id": "notes.info", "title": "问那几篇还在不在" }
+  ],
+  "license": { "required": false, "trial_days": 0 },
+  "signature": null
+}

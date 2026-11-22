@@ -37,6 +37,9 @@ mod window_placement;
 mod text_document;
 mod models;
 mod file_system;
+// 插件模式协议地基（P1-a）；传输与数据档接进来前，先只放地基。
+#[allow(dead_code)]
+mod plugin;
 mod app_logger {
     pub fn warn(scope: &str, message: &str) { eprintln!("[{scope}] {message}"); }
 }
@@ -143,9 +146,21 @@ fn save_closing_workspace_placement(workspace: &Workspace, window: &gpui::Window
 }
 
 fn main() {
+    // `--probe` 那一发排在最前：自述只读 env、打进 stdout 就退，绝不动桌面壳／租约／数据面（装机脚本的入口）。
+    if std::env::args().any(|argument| argument == "--probe") {
+        plugin::runtime::probe();
+        return;
+    }
     if let Some(code) = app_data::run_command() { std::process::exit(code); }
     #[cfg(target_os = "macos")]
     if let Some(code) = ui::updates::run_install_command() { std::process::exit(code); }
+    // 插件模式（宿主经 `PINGLOSS_PLUGIN_SOCKET`＋`PINGLOSS_PLUGIN_DATA` 拉起这一格）自成一路：
+    // 先绑数据面、握完手再建窗，走 [`plugin::runtime`] 那扇窄窗。下面这行 return 之前，桌面壳那套
+    // 数据租约／托盘／单实例／更新器一行都不碰（D-B①：真源是宿主的 `notes.db`，不是 `com.nomo.desktop`）。
+    if let Some(endpoints) = plugin::endpoints::Endpoints::from_env() {
+        plugin::runtime::run(endpoints);
+        return;
+    }
     #[cfg(feature = "nomo-mark-demo")]
     let nomo_mark_demo = std::env::args().any(|argument| matches!(argument.as_str(), "--nomo-mark-demo" | "--editor-control-demo"));
     #[cfg(feature = "nomo-mark-demo")]
