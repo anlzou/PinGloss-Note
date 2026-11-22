@@ -957,6 +957,19 @@ impl NomoMark {
         }
         let text = cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default();
         let at = self.local_cursor();
+        // P2：非纯文本粘贴时，剪贴板若是一行本地图片路径或 `file://`，转成 `![alt](path)`。
+        // 代码上下文与表格单元格保持原文本、不转换（与现有侧车口径一致）。
+        if !plain && !self.auxiliary_input {
+            if let Some(markdown) = super::image_paste::pasted_image_markdown(&text) {
+                let in_literal = self.host.parsed.nodes.iter().any(|n| n.kind == "code" && n.source.contains(&at))
+                    || self.host.parsed.inline.iter().any(|s| s.format == InlineFormat::Code && s.content.start <= at && at <= s.content.end);
+                let in_cell = super::table_inline::html_cell(&self.host.parsed, &(at..at)).is_some();
+                if !in_literal && !in_cell {
+                    self.command(EditIntent::Replace(markdown), cx);
+                    return;
+                }
+            }
+        }
         let semantic = self.effective_mode() == ViewMode::Semantic && !self.auxiliary_input;
         let html = if semantic && !plain { crate::clipboard::read_html() } else { None };
         let literal_context = self.host.parsed.nodes.iter().any(|n| n.kind == "code" && n.source.contains(&at))
