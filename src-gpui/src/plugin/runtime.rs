@@ -120,6 +120,10 @@ struct Engine {
     root_path: Option<PathBuf>,
     /// `folders.snapshot` 里那排 `{id, dir_name}`；`note.new` 据此定新正文落在哪个夹。
     folders: HashMap<i64, String>,
+    /// 攒着待推给宿主的那一发 `host.notes_changed`（§4.3 P3b）：改了状态的 op（`note.new`／`notes.rename`）
+    /// 在 `handle` 里只**记账**、不直接发——发要靠 `serve` 那一侧的 `session`，而 `handle` 拿不到它。
+    /// `serve` 的泵每办成一条就把这一格取走、`request` 出去；没接（旧宿主／缺权限）也不留，2 s TTL 兜底。
+    pending_change: Option<Value>,
 }
 
 impl Engine {
@@ -274,6 +278,7 @@ impl Engine {
                 };
                 let path = root.resolve(&row.body_path).unwrap_or_default();
                 sink(UiCommand::OpenNote { markdown: String::new(), path });
+                self.note_changed(folder, row.id, "created");
                 Dispatch::Done(json!({ "queued": true, "id": row.id }))
             }
             "notes.rename" => {
@@ -291,10 +296,13 @@ impl Engine {
                     Err(error) => return failed("rename_failed", error),
                 };
                 match self.db.rename_body(&root, &row, stem) {
-                    Ok(new_abs) => Dispatch::Done(json!({
-                        "note_id": id,
-                        "path": new_abs.to_string_lossy(),
-                    })),
+                    Ok(new_abs) => {
+                        self.note_changed(row.folder_id, id, "renamed");
+                        Dispatch::Done(json!({
+                            "note_id": id,
+                            "path": new_abs.to_string_lossy(),
+                        }))
+                    }
                     Err(error) => failed("rename_failed", error),
                 }
             }
@@ -343,6 +351,17 @@ impl Engine {
         sink(UiCommand::OpenNote { markdown, path: abs });
         Dispatch::Done(json!({ "queued": true }))
     }
+
+    /// 攒一条待推的 `host.notes_changed`（§4.3 P3b）：载荷 `{folder, note_id, kind, title?}`，字段名照文档那一格。
+    /// 只**记账**、不在 `handle` 里发（那里拿不到 `session`）——发由 [`serve`] 的泵在 `handle` 返回后做。
+    /// 一条接一个：后一条盖过前一条（2 s TTL 还在兜底，推漏一条只是退化成今天的时延）。
+    fn note_changed(&mut self, folder: i64, note_id: i64, kind: &str) {
+        self.pending_change = Some(json!({
+            "folder": folder,
+            "note_id": note_id,
+            "kind": kind,
+        }));
+    }
 }
 
 /// 一条连接的常驻泵：开 `notes.db` → 一帧一帧 `pump`，办到的每一格交 `sink`，对端关闭就返回。
@@ -356,11 +375,26 @@ pub fn serve(mut session: Session, mut sink: impl FnMut(UiCommand)) -> Result<()
         db_path,
         root_path: None,
         folders: HashMap::new(),
+        pending_change: None,
     };
     loop {
         let step = session.pump(&mut |op, payload| engine.handle(op, payload, &mut sink))?;
         match step {
-            crate::plugin::dispatch::Step::Served { .. } => {}
+            crate::plugin::dispatch::Step::Served { .. } => {
+                // 改了状态那一发（`note.new`／`notes.rename`）攒下了变更账，趁这条连接还活着尽力推给宿主
+                // （§4.3 P3b）。`request` 里若宿主又发来一条请求，照常就地办掉。
+                // ⚠ 这一发的成败**不致命也不重试**：旧宿主没把 `host.notes_changed` 接进代理表、缺 `history.write`
+                // 权限、或它卡在上一趟往返上没在预算内回话，都只让这次即时刷新落空——2 s 轮询 TTL 还在兜底，
+                // 事件丢失最多退化成今天「等一个轮询」的时延，不能因为推不动就把这跟泵线程判死。
+                if let Some(change) = engine.pending_change.take() {
+                    let _ = session.request(
+                        &mut |op, payload| engine.handle(op, payload, &mut sink),
+                        "host.notes_changed",
+                        change,
+                        Duration::from_secs(2),
+                    );
+                }
+            }
             crate::plugin::dispatch::Step::Idle => std::thread::sleep(Duration::from_millis(2)),
             crate::plugin::dispatch::Step::Closed => return Ok(()),
         }
@@ -631,6 +665,7 @@ mod tests {
             db_path: db_path.to_path_buf(),
             root_path: None,
             folders: HashMap::new(),
+            pending_change: None,
         }
     }
 
@@ -728,5 +763,103 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["note_id"].as_i64().unwrap(), id);
         assert_eq!(entries[0]["exists"], json!(true));
+    }
+
+    /// P3b 推送的环回验：假宿主拨进来、握完手、先 `folders.snapshot` 绑根，再发一条 `note.new`；
+    /// 插件这一头 [`serve`] 的泵办完 `note.new` 后，**反过来**向宿主推一发 `host.notes_changed`
+    /// （载荷 `{folder, note_id, kind:"created"}`）。宿主读那一帧、回一句 `ok:true`，插件就地收账继续。
+    /// 全程不碰 GPUI：验的就是 `handle` 记账 → `serve` 用 `Session::request` 发出去这一段接线。
+    #[test]
+    fn a_new_note_pushes_host_notes_changed_back_to_the_host() {
+        let data = tempfile::Builder::new()
+            .prefix("nomo-rt-push-db")
+            .tempdir()
+            .unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("nomo-rt-push-root")
+            .tempdir()
+            .unwrap();
+        let socket = socket("push");
+
+        let mut server = Server::bind(&socket, identity(), Duration::from_secs(5)).unwrap();
+
+        let data_dir = data.path().to_string_lossy().to_string();
+        let body_root = root.path().to_string_lossy().to_string();
+        let host_socket = socket.clone();
+        // 假宿主：握手 → 绑根 → note.new（各等一帧答复）→ 读插件反向推来的那一帧、回 ok。交回那一帧原文供断言。
+        let host = thread::spawn(move || {
+            let mut host = Stream::connect(&host_socket, Duration::from_secs(5)).unwrap();
+            let _hello = host.wait_msg(Duration::from_secs(5)).unwrap();
+            host.send(&HelloOk {
+                protocol: PROTOCOL,
+                capabilities: vec!["folders.snapshot".into(), "note.new".into()],
+                data_dir: data_dir.clone(),
+            })
+            .unwrap();
+            host.send(
+                &Envelope::Request {
+                    request: 1,
+                    op: "folders.snapshot".to_string(),
+                    payload: json!({ "root": body_root, "folders": [{ "id": 7, "dir_name": "inbox" }] }),
+                }
+                .to_value(),
+            )
+            .unwrap();
+            let _snapshot_reply = host.wait_msg(Duration::from_secs(5)).unwrap();
+            host.send(
+                &Envelope::Request {
+                    request: 2,
+                    op: "note.new".to_string(),
+                    payload: json!({ "folder_id": 7 }),
+                }
+                .to_value(),
+            )
+            .unwrap();
+            let _new_reply = host.wait_msg(Duration::from_secs(5)).unwrap();
+            // 反向那一帧：插件用 `host.notes_changed` 把「刚新建了哪一篇」推回来。
+            let pushed = host.wait_msg(Duration::from_secs(5)).unwrap();
+            if let Ok(Envelope::Request { request, .. }) = Envelope::from_value(&pushed) {
+                host.send(
+                    &Envelope::Reply {
+                        request,
+                        payload: json!({ "ok": true }),
+                    }
+                    .to_value(),
+                )
+                .unwrap();
+            }
+            drop(host); // 关掉连接，让插件泵走到 Step::Closed 收工。
+            pushed
+        });
+
+        let session = handshake_before_window(&mut server, Duration::from_secs(5)).unwrap();
+        let (tx, rx) = mpsc::channel::<UiCommand>();
+        serve(session, move |command| {
+            let _ = tx.send(command);
+        })
+        .unwrap();
+
+        let pushed = host.join().unwrap();
+        match Envelope::from_value(&pushed).unwrap() {
+            Envelope::Request { op, payload, .. } => {
+                assert_eq!(op, "host.notes_changed", "泵该用 §4.3 那条名字反推");
+                assert_eq!(payload["kind"], json!("created"));
+                assert_eq!(payload["folder"], json!(7), "folder 用宿主给的 folder_id");
+                assert!(payload["note_id"].is_i64(), "note_id 要给出刚造那号：{payload}");
+            }
+            other => panic!("插件反推那一帧解成了 {other:?}"),
+        }
+        // sink 那边照常收到绑根与开新篇两格——推送这一步不该把递给界面的格挤掉。
+        let seen: Vec<UiCommand> = rx.try_iter().collect();
+        assert!(
+            matches!(
+                seen.as_slice(),
+                [UiCommand::FoldersChanged, UiCommand::OpenNote { .. }]
+            ),
+            "sink 收格不符：{seen:?}"
+        );
+
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
     }
 }
