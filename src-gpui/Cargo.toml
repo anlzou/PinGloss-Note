@@ -2,6 +2,7 @@
 name = "nomo-gpui"
 version.workspace = true
 edition = "2024"
+rust-version = "1.99"
 publish = false
 license = "AGPL-3.0-or-later"
 description = "Nomo native Markdown editor"
