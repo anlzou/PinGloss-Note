@@ -40,6 +40,27 @@ target=x86_64-unknown-linux-gnu
 target_dir="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.target_directory')"
 
 if ! $skip_build; then
+  # GPUI 的 x11 那一头在链接期点名 `-lxkbcommon-x11`，而链接器只认 dev 符号链
+  # `libxkbcommon-x11.so`；本机（Ubuntu）的 `libxkbcommon-x11` 运行时包只带 `.so.0`，`.pc` 也没装。
+  # 差的就是那一枚链，报出来却像"编译失败"（`找不到 -lxkbcommon-x11`）。这一格在 `target/` 下现补：
+  # 走 `LIBRARY_PATH` 而不写 `RUSTFLAGS="-L …"`——后者会改到每一枚依赖的指纹，把整棵 Release 树重编一遍。
+  # 只在确实缺的时候动手，不碰系统库目录（不要 sudo）。
+  for soname in xkbcommon-x11; do
+    case "$(cc -print-file-name="lib$soname.so")" in
+      /*) ;;  # 链接器本来就找得到 ⇒ 什么都不加
+      *)
+        runtime="$(ls -1 "/usr/lib/"*-linux-gnu"/lib$soname".so.* /usr/lib/"lib$soname".so.* 2>/dev/null | sort -V | head -1 || true)"
+        [[ -n "$runtime" ]] || {
+          echo "缺 lib$soname 的运行时库（连 .so.0 都没有），装提供它的包后再打包。" >&2
+          exit 1
+        }
+        mkdir -p "$target_dir/native-link"
+        ln -sfn "$runtime" "$target_dir/native-link/lib$soname.so"
+        export LIBRARY_PATH="$target_dir/native-link${LIBRARY_PATH:+:$LIBRARY_PATH}"
+        echo "[链接] 补 $soname 的 dev 符号链: $target_dir/native-link/lib$soname.so -> $runtime"
+        ;;
+    esac
+  done
   echo "[构建] cargo build --locked --release --target $target --bin nomo"
   cargo build --locked --release --target "$target" --bin nomo
 fi
