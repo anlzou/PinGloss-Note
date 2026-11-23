@@ -99,9 +99,10 @@ assert m["version"] == "0.2.0", m["version"]          # 与 Nomo 版本解耦（
 assert m["min_host"] == "0.9.597", m["min_host"]      # 转发 notes.rename 的那一下限
 assert m["entry"] == {"path": "bin/pingloss-notes"}, m["entry"]  # D-D①：名沿用 pingloss-notes
 assert m["signature"] is None, m["signature"]         # 随包内置＝null，由安装包整体校验兜底
+assert m.get("display_name") == "笔记", m.get("display_name")  # 宿主 0.9.638 起读那位（屏上第一列；没写回 id）
 ops = [o["id"] for o in m["operations"]]
 assert ops == ["folders.snapshot", "notes.open", "notes.list", "note.new", "notes.rename", "notes.info"], ops
-print(f"[清单] plugin.json 十一位齐、version={m['version']}、min_host={m['min_host']}、六条 op 与运行侧一致")
+print(f"[清单] plugin.json 十一位齐＋display_name 在场、version={m['version']}、min_host={m['min_host']}、六条 op 与运行侧一致")
 PY
 
 # 自证②：那颗产物独立手起 `--probe` 要吐一份自述 JSON、退 0（不碰显示、不碰数据面；口径同 `pingloss-todo`）。
