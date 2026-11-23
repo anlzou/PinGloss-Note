@@ -212,7 +212,7 @@ impl Db {
     pub fn create_note(&mut self, root: &Root, dir_name: &str, folder_id: i64) -> Res<NoteRow> {
         check_dir_name(dir_name)?;
         let ts = now_ms();
-        let mut tx = self.conn.transaction().es()?;
+        let tx = self.conn.transaction().es()?;
         tx.execute(
             "INSERT INTO notes (kind, folder_id, title, enc, body_path, created_at_ms, updated_at_ms, bytes) \
              VALUES (?1, ?2, NULL, ?3, '', ?4, ?5, 0)",

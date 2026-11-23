@@ -10,6 +10,8 @@
 //! Nomo 这发不假装支持）。非 unix 的 [`Stream`]／[`Listener`] 方法一律交回一句明确的 `Err`，不静默成功、
 //! 不谎报——症状「插件起来了、宿主永远连不上」正是靠「宁可当场报错」挡住的。
 
+// 两个 trait 只在 unix 那几臂的 socket 读写上被点兵；非 unix 构建整臂编掉，import 跟着走。
+#[cfg(unix)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -160,9 +162,11 @@ impl Stream {
     }
 
     /// 发一帧（一行 + 换行）。非阻塞 socket 上的部分写用 `write_buf` 续着写完。
-    pub fn send_line(&mut self, mut line: String) -> Res<()> {
+    pub fn send_line(&mut self, line: String) -> Res<()> {
         #[cfg(unix)]
         {
+            // mut 只归这一臂（append 换行的是它）；挂在签名上非 unix 构建就没人改它。
+            let mut line = line;
             line.push('\n');
             let bytes = line.into_bytes();
             self.write_buf.extend_from_slice(&bytes);
