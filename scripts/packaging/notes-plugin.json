@@ -1,5 +1,6 @@
 {
   "id": "notes",
+  "display_name": "笔记",
   "kind": "ui",
   "version": "0.2.0",
   "protocol": 1,
