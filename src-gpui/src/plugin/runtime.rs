@@ -32,6 +32,8 @@ use crate::plugin::endpoints::Endpoints;
 use crate::plugin::session::{Identity, Server, Session};
 use crate::plugin::storage::{derive_title, first_line, note_text, Db, NoteKind, Root};
 
+const PLUGIN_DISPLAY_NAME: &str = "PinGloss-Note x Nomo";
+
 /// 泵线程递给界面那一格的东西。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiCommand {
@@ -70,6 +72,7 @@ pub fn probe() {
     let endpoints = Endpoints::from_env();
     let descriptor = json!({
         "app": "nomo",
+        "display_name": PLUGIN_DISPLAY_NAME,
         "plugin_id": "notes",
         "version": env!("CARGO_PKG_VERSION"),
         "mode": "probe",
@@ -465,7 +468,7 @@ fn run_unix(endpoints: Endpoints) {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Nomo · 笔记".into()),
+                        title: Some(PLUGIN_DISPLAY_NAME.into()),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -571,6 +574,11 @@ mod tests {
             plugin_version: "0.7.3".to_string(),
             host_version: "0.9.131".to_string(),
         }
+    }
+
+    #[test]
+    fn plugin_display_name_is_the_cobrand() {
+        assert_eq!(PLUGIN_DISPLAY_NAME, "PinGloss-Note x Nomo");
     }
 
     /// 环回验 P1-c 那两步（先握手、后泵）：假宿主拨进来 → 读完插件的 `Hello` 答 `HelloOk`（带 `data_dir`）

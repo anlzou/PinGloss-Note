@@ -1,11 +1,11 @@
 {
   "id": "notes",
-  "display_name": "笔记",
+  "display_name": "PinGloss-Note x Nomo",
   "kind": "ui",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "protocol": 1,
   "min_host": "0.9.597",
-  "entry": { "path": "bin/pingloss-notes" },
+  "entry": { "path": "bin/PinGloss-Note x Nomo" },
   "capabilities": [],
   "permissions": ["history.read", "folders.read", "clipboard.write", "filesystem.write:folders"],
   "operations": [

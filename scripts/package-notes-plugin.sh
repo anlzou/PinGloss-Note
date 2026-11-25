@@ -2,20 +2,20 @@
 # 把 Nomo 打成 PingGloss 的 `notes` 随包插件树（重构文档 §9 P1）：
 #   .artifacts/plugins/notes-<时间戳>/share/pingloss/plugins/notes/
 #     ├── plugin.json          清单（§5.4 第 2 条：version 与 min_host 由发布人主动改）
-#     ├── bin/pingloss-notes   产物（D-D①：名沿用 pingloss-notes，内容就是 `nomo`）
+#     ├── bin/PinGloss-Note x Nomo   产物（D-D①：联名可执行名，内容就是 `nomo`）
 #     ├── LICENSE              AGPL-3.0-or-later 原文（D-A② 那句"随包附许可声明"）
 #     ├── SOURCE.md            **当趟生成**的源码要约（commit／构建命令／产物 sha256／三年有效期）
 #     └── licenses/            组件各自许可四份（摆法照 package-linux.sh，不在这里另造口径）
 #
 # 这一格只**组装**、不自装不发布（AGENTS：scripts/ 的产物写 `.artifacts`，绝不自动安装／打标签／发布）。
-# 宿主按清单 `entry.path` = `bin/pingloss-notes` 拉起这颗进程（D-D①：二进制名沿用 `pingloss-notes`，
+# 宿主按清单 `entry.path` = `bin/PinGloss-Note x Nomo` 拉起这颗进程（D-D①：二进制名为联名可执行名，
 # 历史栏／待办／热键的调用方一行不改）；插件模式靠 spawn 那两位 env 判定（见
 # `src-gpui/src/plugin/endpoints.rs`），不是靠 `--mode`，所以清单用 `path` 那一形、不用 `self_mode`。
 #
 # ⚠ **Linux-first**：插件模式的数据面（unix socket）今天只在 Linux/Unix 接线，非 unix 上 `runtime::run`
 #    碰 GPUI 之前就退 2。这一发也照 `package-linux.sh` 钉在 x86_64 Linux。
 #
-# 清单那三位与 root Cargo.toml 解耦（重构文档 §5.4 第 2 条）：`version`＝插件包自己的号（0.2.0）、
+# 清单那三位与 root Cargo.toml 解耦（重构文档 §5.4 第 2 条）：`version`＝插件包自己的号（0.2.1）、
 # `min_host`＝宿主里能转发全部六条 op（含 `notes.rename`，落地于 v0.9.597）的那一下限。二者都写在
 # `scripts/packaging/notes-plugin.json` 里、由发布人主动改，不随 Nomo 涨版自动动。
 set -euo pipefail
@@ -69,7 +69,7 @@ if ! $skip_build; then
   echo "[构建] cargo build --locked --release --target $target --bin nomo"
   cargo build --locked --release --target "$target" --bin nomo
 fi
-# Nomo 编出来的那颗就叫 `nomo`；进插件树按清单 entry 改名为 `bin/pingloss-notes`（内容同一颗）。
+# Nomo 编出来的那颗就叫 `nomo`；进插件树按清单 entry 改名为 `bin/PinGloss-Note x Nomo`（内容同一颗）。
 binary="$target_dir/$target/release/nomo"
 [[ -x "$binary" ]] || { echo "找不到产物 $binary（先不带 --skip-build 编一发）" >&2; exit 1; }
 file "$binary" | grep -q 'ELF 64-bit.*x86-64'
@@ -85,8 +85,8 @@ mkdir -p "$stage/$plugin_rel/bin"
 
 # ① 清单：原样搬进随包那一格（0644）。
 install -m 644 scripts/packaging/notes-plugin.json "$stage/$plugin_rel/plugin.json"
-# ② 那颗产物按 `entry.path` 摆进 `bin/pingloss-notes`（可执行位 0755）。
-install -m 755 "$binary" "$stage/$plugin_rel/bin/pingloss-notes"
+# ② 那颗产物按 `entry.path` 摆进 `bin/PinGloss-Note x Nomo`（可执行位 0755）。
+install -m 755 "$binary" "$stage/$plugin_rel/bin/PinGloss-Note x Nomo"
 
 # ③ 许可原文随包（D-A②／重构文档 §5.4 第 5 条那句"若选 AGPL 分发，必须随包附源码与许可声明"）。
 #    ⚠ 这一棵树走的是**用户自装**那一档：装出去的那一格自己带许可，不指望安装包里的 notices ——
@@ -94,8 +94,8 @@ install -m 755 "$binary" "$stage/$plugin_rel/bin/pingloss-notes"
 #    与这一棵树无关，也不许把它塞进那一颗的位置（D-A②／§10 R-1）。
 install -m 644 LICENSE "$stage/$plugin_rel/LICENSE"
 #    ⚠ 随包树这一头发多了三位（`LICENSE`／`licenses/`／`SOURCE.md`），清单那一格没动 ⇒ 真把这棵树发出去
-#    那一发要把 `scripts/packaging/notes-plugin.json` 的 `version` 抬一格（§5.4 第 2 条：这一位与 Nomo 版本
-#    解耦、由发布人主动改）。本仓今天还没有对外发过这一棵树，所以这一发没动那位（还是 `0.2.0`）。
+#    那一发要把 `scripts/packaging/notes-plugin.json` 的 `version` 再抬一格（§5.4 第 2 条：这一位与 Nomo 版本
+#    解耦、由发布人主动改）。联名这一发把包版本从 `0.2.0` 抬到 `0.2.1`，后续发布不得沿用这一位。
 #    组件各自许可那一份照 `package-linux.sh` 的摆法（同名同来源，不在这里另造一套口径）：
 #    桌面包放 `usr/share/doc/nomo/`，插件树里没有 doc 那一层，就放在包自己那一格下面的 `licenses/`。
 mkdir -p "$stage/$plugin_rel/licenses"
@@ -114,7 +114,7 @@ source_url="$(git -C "$root" remote get-url origin 2>/dev/null || echo '')"
 nomo_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
 plugin_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["version"])' \
   "$stage/$plugin_rel/plugin.json")"
-bin_sha="$(sha256sum "$stage/$plugin_rel/bin/pingloss-notes" | cut -c1-64)"
+bin_sha="$(sha256sum "$stage/$plugin_rel/bin/PinGloss-Note x Nomo" | cut -c1-64)"
 built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # 纸上那句"sha256 与源码一一对应"只在树干净时成立：未提交的改动不进 commit，抄上去就成了假账。
 # `--skip-build` 那一趟更容易碰见（产物是早先那次构建留下的），所以这一位现读、把话头跟着收。
@@ -131,7 +131,7 @@ fi
 cat > "$stage/$plugin_rel/SOURCE.md" <<EOF
 # \`notes\` 插件包的许可与源码声明
 
-这一格是 **PingGloss** 的 \`notes\` 插件（清单＝同目录 \`plugin.json\`，可执行＝\`bin/pingloss-notes\`），
+这一格是 **PinGloss-Note x Nomo** 的 \`notes\` 插件（清单＝同目录 \`plugin.json\`，可执行＝\`bin/PinGloss-Note x Nomo\`），
 由 Nomo 以插件模式构建。Nomo 采用 **AGPL-3.0-or-later**：原文见同目录 \`LICENSE\`，随包的第三方组件
 许可见 \`licenses/\`。按 AGPL-3.0 §13，随可执行文件交出的是**完整对应源码**，或下面这一纸指向源码的要约。
 
@@ -150,7 +150,7 @@ cat > "$stage/$plugin_rel/SOURCE.md" <<EOF
 | 打包那一下的工作区 | $workspace_state |
 | 打包时间 | $built_at（UTC） |
 
-拿到 \`bin/pingloss-notes\` 的人算一下 sha256 就能核对：对上表里那一串 ⇒ 这一颗就是那一枚 commit 的产物。
+拿到 \`bin/PinGloss-Note x Nomo\` 的人算一下 sha256 就能核对：对上表里那一串 ⇒ 这一颗就是那一枚 commit 的产物。
 
 ## 修改说明
 
@@ -184,11 +184,11 @@ assert not missing, f"清单缺必填位：{missing}"
 assert m["id"] == "notes", m["id"]
 assert m["kind"] == "ui", m["kind"]
 assert m["protocol"] == 1, m["protocol"]
-assert m["version"] == "0.2.0", m["version"]          # 与 Nomo 版本解耦（§5.4②）
+assert m["version"] == "0.2.1", m["version"]          # 与 Nomo 版本解耦（§5.4②）
 assert m["min_host"] == "0.9.597", m["min_host"]      # 转发 notes.rename 的那一下限
-assert m["entry"] == {"path": "bin/pingloss-notes"}, m["entry"]  # D-D①：名沿用 pingloss-notes
+assert m["entry"] == {"path": "bin/PinGloss-Note x Nomo"}, m["entry"]  # D-D①：联名可执行名
 assert m["signature"] is None, m["signature"]         # 随包内置＝null，由安装包整体校验兜底
-assert m.get("display_name") == "笔记", m.get("display_name")  # 宿主 0.9.638 起读那位（屏上第一列；没写回 id）
+assert m.get("display_name") == "PinGloss-Note x Nomo", m.get("display_name")  # 宿主 0.9.638 起读那位（屏上第一列；没写回 id）
 ops = [o["id"] for o in m["operations"]]
 assert ops == ["folders.snapshot", "notes.open", "notes.list", "note.new", "notes.rename", "notes.info"], ops
 print(f"[清单] plugin.json 十一位齐＋display_name 在场、version={m['version']}、min_host={m['min_host']}、六条 op 与运行侧一致")
@@ -196,14 +196,15 @@ PY
 
 # 自证②：那颗产物独立手起 `--probe` 要吐一份自述 JSON、退 0（不碰显示、不碰数据面；口径同 `pingloss-todo`）。
 # 没有宿主 spawn 的两格 env ⇒ `data_socket`／`data_dir` 该是 null，不是错——装机的人据此分得清「没装好」。
-probe="$("$stage/$plugin_rel/bin/pingloss-notes" --probe)"
+probe="$("$stage/$plugin_rel/bin/PinGloss-Note x Nomo" --probe)"
 python3 - "$probe" <<'PY'
 import json, sys
 d = json.loads(sys.argv[1])
 assert d["app"] == "nomo" and d["plugin_id"] == "notes", d
+assert d["display_name"] == "PinGloss-Note x Nomo", d
 assert d["mode"] == "probe" and d["protocol"] == 1, d
 assert d["data_socket"] is None and d["data_dir"] is None, d
-print(f"[探针] bin/pingloss-notes --probe 交回自述、退 0（Nomo 版本 {d['version']}）")
+print(f"[探针] bin/PinGloss-Note x Nomo --probe 交回联名自述、退 0（Nomo 版本 {d['version']}）")
 PY
 
 # 自证③：许可那三位齐备、且**这一趟的**读数写在纸上（D-A②／§5.4 第 5 条那一句的出口）。
@@ -231,7 +232,7 @@ for needle, label in ((commit, "当趟的 commit"),
                       ("三年", "要约的有效期"),
                       ("src-gpui/src/plugin", "修改说明那一节指到的功能层")):
     assert needle in offer, f"SOURCE.md 里读不到{label}：{needle}"
-actual = hashlib.sha256((rel / "bin" / "pingloss-notes").read_bytes()).hexdigest()
+actual = hashlib.sha256((rel / "bin" / "PinGloss-Note x Nomo").read_bytes()).hexdigest()
 assert actual == bin_sha, f"纸上的 sha256 与产物不符：{bin_sha} vs {actual}"
 manifest = json.loads((rel / "plugin.json").read_text(encoding="utf-8"))
 assert manifest["license"] == {"required": False, "trial_days": 0}, manifest["license"]

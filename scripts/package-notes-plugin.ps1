@@ -1,8 +1,8 @@
 ﻿# package-notes-plugin.sh 的 Windows 形状（重构文档 §9 P1，钉在 x86_64-pc-windows-msvc）：
-#   .artifacts/plugins/notes-<时间戳>/share/pingloss/plugins/notes/{plugin.json,bin/pingloss-notes.exe,vcruntime140.dll}
+#   .artifacts/plugins/notes-<时间戳>/share/pingloss/plugins/notes/{plugin.json,bin/PinGloss-Note x Nomo.exe,vcruntime140.dll}
 #
 # 这一格只**组装**、不自装不发布（AGENTS：scripts/ 的产物写 `.artifacts`，绝不自动安装／打标签／发布）。
-# 清单 `entry.path` 仍写不带 `.exe` 的 `bin/pingloss-notes`：宿主 spawn.rs 2026-11-14 D-117 那一发是
+# 清单 `entry.path` 仍写不带 `.exe` 的 `bin/PinGloss-Note x Nomo`：宿主 spawn.rs 2026-11-14 D-117 那一发是
 # "先试精确路径、缺失再试平台后缀"，同一份清单两平台共用，不在这里分出 Windows 副本。
 #
 # ⚠ **本文件存成 UTF-8 带 BOM＋CRLF**，Windows PowerShell 5.1 与 PowerShell 7 都能跑。去掉 BOM 的那一刻
@@ -17,7 +17,7 @@
 #
 # ⚠ 随 bin 带一颗 `vcruntime140.dll`：Rust MSVC 动态链 VC 运行库（口径同 package-windows.ps1 的
 #    dumpbin 闸），没装 Build Tools 的机器才加载得动；Windows 的 DLL 搜索顺序先查 exe 自己那格目录，
-#    所以 dll 与 `pingloss-notes.exe` 并排放在 `bin/` 里就够了。
+#    所以 dll 与 `PinGloss-Note x Nomo.exe` 并排放在 `bin/` 里就够了。
 #
 # 清单那三位与 root Cargo.toml 解耦（重构文档 §5.4 第 2 条）：`version`＝插件包自己的号、
 # `min_host`＝宿主能转发全部六条 op 的那一下限，都住在 `scripts/packaging/notes-plugin.json`，
@@ -101,7 +101,7 @@ try {
         foreach ($line in @($build.Stdout) + @($build.Stderr)) { Write-Output $line }
         if ($build.Exit -ne 0) { throw 'Cargo release build failed' }
     }
-    # Nomo 编出来的那颗就叫 `nomo.exe`；进插件树按清单 entry 补平台后缀摆成 `bin/pingloss-notes.exe`（内容同一颗）。
+    # Nomo 编出来的那颗就叫 `nomo.exe`；进插件树按清单 entry 补平台后缀摆成 `bin/PinGloss-Note x Nomo.exe`（内容同一颗）。
     $targetDirectory = (($metadata.Stdout -join "`n") | ConvertFrom-Json).target_directory
     $binary = Join-Path $targetDirectory "$target/release/nomo.exe"
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "找不到产物 $binary（先不带 -SkipBuild 编一发）" }
@@ -133,8 +133,8 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $pluginDir 'bin') -Force | Out-Null
     # ①' 清单：原样搬进随包那一格。
     Copy-Item -LiteralPath 'scripts/packaging/notes-plugin.json' -Destination (Join-Path $pluginDir 'plugin.json')
-    # ②' 那颗产物按 `entry.path`＋平台后缀摆进 `bin/pingloss-notes.exe`。
-    Copy-Item -LiteralPath $binary -Destination (Join-Path $pluginDir 'bin/pingloss-notes.exe')
+    # ②' 那颗产物按 `entry.path`＋平台后缀摆进 `bin/PinGloss-Note x Nomo.exe`。
+    Copy-Item -LiteralPath $binary -Destination (Join-Path $pluginDir 'bin/PinGloss-Note x Nomo.exe')
     # ③' VC 运行库与 exe 并排（头上 ⚠：DLL 搜索先查 exe 自己那格目录）。
     $runtimeDirectories = @(Get-ChildItem -LiteralPath (Join-Path $env:VCToolsRedistDir 'x64') -Directory -Filter 'Microsoft.VC*.CRT')
     if ($runtimeDirectories.Count -ne 1) { throw 'Expected one x64 VC redistributable CRT directory.' }
@@ -152,12 +152,13 @@ try {
     if ($missing) { throw "清单缺必填位：$($missing -join ', ')" }
     if ($m.id -ne 'notes') { throw "id 应为 notes，读到 $($m.id)" }
     if ($m.kind -ne 'ui') { throw "kind 应为 ui，读到 $($m.kind)" }
+    if ($m.display_name -ne 'PinGloss-Note x Nomo') { throw "display_name 应为 PinGloss-Note x Nomo，读到 $($m.display_name)" }
     if ($m.protocol -ne 1) { throw "protocol 应为 1，读到 $($m.protocol)" }
-    if ($m.version -ne '0.2.0') { throw "version 应为 0.2.0，读到 $($m.version)" }        # 与 Nomo 版本解耦（§5.4②）
+    if ($m.version -ne '0.2.1') { throw "version 应为 0.2.1，读到 $($m.version)" }        # 与 Nomo 版本解耦（§5.4②）
     if ($m.min_host -ne '0.9.597') { throw "min_host 应为 0.9.597，读到 $($m.min_host)" }  # 转发 notes.rename 的那一下限
     $entryProps = @($m.entry.PSObject.Properties.Name)
-    if ($entryProps.Count -ne 1 -or $entryProps[0] -ne 'path' -or $m.entry.path -ne 'bin/pingloss-notes') {
-        throw ('entry 应为 {"path": "bin/pingloss-notes"}（D-D①：名沿用 pingloss-notes，.exe 交给宿主补），读到 ' + ($m.entry | ConvertTo-Json -Compress))
+    if ($entryProps.Count -ne 1 -or $entryProps[0] -ne 'path' -or $m.entry.path -ne 'bin/PinGloss-Note x Nomo') {
+        throw ('entry 应为 {"path": "bin/PinGloss-Note x Nomo"}（D-D①：联名可执行名为 PinGloss-Note x Nomo，.exe 交给宿主补），读到 ' + ($m.entry | ConvertTo-Json -Compress))
     }
     if ($null -ne $m.signature) { throw 'signature 应为 null（随包内置由安装包整体校验兜底）' }
     $ops = @($m.operations | ForEach-Object { $_.id })
@@ -167,15 +168,16 @@ try {
 
     # ⑥ 自证②：那颗产物独立手起 `--probe` 要吐一份自述 JSON、退 0（不碰显示、不碰数据面）。
     # 没有宿主 spawn 的两格 env ⇒ `data_socket`／`data_dir` 该是 null，不是错——装机的人据此分得清「没装好」。
-    $staged = Join-Path $pluginDir 'bin/pingloss-notes.exe'
+    $staged = Join-Path $pluginDir 'bin/PinGloss-Note x Nomo.exe'
     $probe = Invoke-Captured -File $staged -Arguments @('--probe')
     if ($probe.Exit -ne 0) { throw "--probe 退 $($probe.Exit)（应为 0）" }
     if ($probe.Stderr.Count -ne 0) { $probe.Stderr | ForEach-Object { Write-Warning $_ } }
     $d = (($probe.Stdout -join "`n").Trim()) | ConvertFrom-Json
     if ($d.app -ne 'nomo' -or $d.plugin_id -ne 'notes') { throw "自述身份不对：$($d | ConvertTo-Json -Compress)" }
+    if ($d.display_name -ne 'PinGloss-Note x Nomo') { throw "自述联名不对：$($d | ConvertTo-Json -Compress)" }
     if ($d.mode -ne 'probe' -or $d.protocol -ne 1) { throw "自述模式/协议不对：$($d | ConvertTo-Json -Compress)" }
     if ($null -ne $d.data_socket -or $null -ne $d.data_dir) { throw "独立手起时 data_socket/data_dir 应为 null：$($d | ConvertTo-Json -Compress)" }
-    Write-Output "[探针] bin/pingloss-notes.exe --probe 交回自述、退 0（Nomo 版本 $($d.version)）"
+    Write-Output "[探针] bin/PinGloss-Note x Nomo.exe --probe 交回联名自述、退 0（Nomo 版本 $($d.version)）"
 
     Write-Output "Nomo notes 插件随包树: $pluginDir"
 } finally {
