@@ -16,6 +16,7 @@
 //! `open`／`create`／`rename` 撞到私有行或私有目录一律**拒绝**（sidecar 原话 "private notes are not
 //! wired yet"）。锁定不是隐藏，是「这条路今天没接」——如实拒，不猜内容。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,7 +36,11 @@ impl<T, E: std::fmt::Display> DisplayErr<T> for Result<T, E> {
 }
 
 /// 与宿主 `pg-notes::db::SCHEMA_VERSION` 同值；落在 `PRAGMA user_version`。
+/// 插件自己的附件宽限账不升这个号，避免宿主把仍兼容的核心库判成新 schema。
 pub const SCHEMA_VERSION: i32 = 2;
+
+/// 插件自有附件失去引用后的最短保留时间。
+pub const ASSET_ORPHAN_GRACE_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// 单篇正文的可改上限（`<=` 才算可编辑），与宿主 `markdown::MAX_DOC_BYTES` 同值。
 pub const MAX_DOC_BYTES: usize = 2 * 1024 * 1024;
@@ -49,6 +54,8 @@ const BODY_EXT: &str = "md";
 /// `notes` 表的列序（读侧 `row.get` 与 SQL 的 `SELECT` 都照这一串；改一处要连着改另一处）。
 const NOTE_COLUMNS: &str =
     "id, kind, folder_id, title, enc, body_path, created_at_ms, updated_at_ms, bytes";
+
+const ASSET_COLUMNS: &str = "id, note_id, kind, rel_path, source_kind, source_ref, bytes, width, height, frames, duration_ms, sha256, created_at_ms";
 
 const NOTES_DDL: &str = r#"CREATE TABLE IF NOT EXISTS notes (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +89,12 @@ const ASSETS_DDL: &str = r#"CREATE TABLE IF NOT EXISTS note_assets (
 )"#;
 
 const ASSETS_INDEX_DDL: &str = "CREATE INDEX IF NOT EXISTS note_assets_note ON note_assets(note_id)";
+
+/// 插件自有的延迟回收账：路径唯一，时间记录首次失去引用的时刻。
+const ASSET_ORPHANS_DDL: &str = r#"CREATE TABLE IF NOT EXISTS nomo_asset_orphans (
+    rel_path       TEXT    PRIMARY KEY,
+    orphaned_at_ms INTEGER NOT NULL
+)"#;
 
 /// `notes.kind`：笔记与待办两条数据线共用一张表，靠这一位分家。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,7 +247,7 @@ impl std::fmt::Display for RenameBodyError {
 
 impl std::error::Error for RenameBodyError {}
 
-/// 数据库提交后待清理的文件；清理失败只留孤儿，不把已消失的数据库行改回来。
+/// 数据库提交后待清理的文件；附件只登记宽限账，正文仍在提交后立即清理。
 #[derive(Debug)]
 pub struct DeletedNote {
     pub body_path: Option<PathBuf>,
@@ -242,11 +255,23 @@ pub struct DeletedNote {
     pub warnings: Vec<String>,
 }
 
+/// 一次启动附件扫收的读数；未知文件只计数，不携带内容或无限路径列表。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AssetSweepReport {
+    pub removed: usize,
+    pub kept_young: usize,
+    pub referenced: usize,
+    pub unrecognized: usize,
+    pub refused: usize,
+    pub failed: usize,
+}
+
 impl Db {
     /// 开库并跑迁移：先读 `PRAGMA user_version`，比 [`SCHEMA_VERSION`] **新**就整个拒（一个字都不写）。
     ///
     /// ⚠ 迁移的幂等由**表在不在**决定、不由 `user_version` 决定：`note_assets` 只要缺席就建（哪怕
     /// 号已经是 2），这是宿主那条「v1→v2 只加 `note_assets`、`notes` 列永不改」的落实。
+    /// `nomo_asset_orphans` 是插件扩展表，不改变宿主核心 schema 版本。
     pub fn open(path: &Path) -> Res<Self> {
         let conn = Connection::open(path).es()?;
         let found: i32 = conn
@@ -335,7 +360,7 @@ impl Db {
         save_note_on(&self.conn, row, body)
     }
 
-    /// 正文与仍被引用的附件同事务落账；未引用的副本不阻止正文保存。
+    /// 正文与仍被引用的附件同事务落账；失去引用的旧行退成孤儿账，文件至少保留 24 h。
     pub fn save_note_with_assets(
         &mut self,
         row: &mut NoteRow,
@@ -345,17 +370,40 @@ impl Db {
     ) -> Res<()> {
         let tx = self.conn.transaction().es()?;
         save_note_on(&tx, row, body)?;
-        let mut seen = std::collections::BTreeMap::new();
-        for asset in assets.iter().filter(|asset| {
-            asset.note_id == row.id && body_references_asset(body, asset)
-        }) {
-            if let Some(previous) = seen.insert(asset.id.as_str(), asset) {
+        let orphaned_at = now_ms();
+        let existing = asset_rows_on(&tx, row.id)?;
+        let mut incoming = std::collections::BTreeMap::new();
+        for asset in assets.iter().filter(|asset| asset.note_id == row.id) {
+            if let Some(previous) = incoming.insert(asset.id.as_str(), asset) {
                 if previous != asset {
                     return Err(format!("附件 {} 在同一批待办里形状不一致", asset.id));
                 }
             }
+        }
+        let mut referenced = std::collections::HashSet::new();
+        for asset in incoming.values() {
+            if !body_references_asset(body, asset) {
+                continue;
+            }
             validate_asset_file(root, row, asset)?;
             put_asset_on(&tx, asset)?;
+            tx.execute("DELETE FROM nomo_asset_orphans WHERE rel_path=?1", params![asset.rel_path]).es()?;
+            referenced.insert(asset.id.as_str());
+        }
+        for asset in existing {
+            if referenced.contains(asset.id.as_str()) || body_references_asset(body, &asset) {
+                tx.execute("DELETE FROM nomo_asset_orphans WHERE rel_path=?1", params![asset.rel_path]).es()?;
+                continue;
+            }
+            tx.execute("DELETE FROM note_assets WHERE id=?1 AND note_id=?2", params![asset.id, row.id]).es()?;
+            if owned_asset_rel(row, &asset).is_some() {
+                register_orphan_on(&tx, &asset.rel_path, orphaned_at)?;
+            }
+        }
+        for asset in incoming.values().filter(|asset| !referenced.contains(asset.id.as_str())) {
+            if owned_asset_rel(row, asset).is_some() {
+                register_orphan_on(&tx, &asset.rel_path, orphaned_at)?;
+            }
         }
         tx.commit().es()?;
         Ok(())
@@ -426,7 +474,8 @@ impl Db {
         Ok(new_abs)
     }
 
-    /// 事务删除笔记行与全部附件行，再清理对应文件。身份列或正文路径在事务里漂移则整趟回滚。
+    /// 事务删除笔记行与全部附件行，提交后只清正文；附件退成宽限账，由扫收在 24 h 后回收。
+    /// 身份列或正文路径在事务里漂移则整趟回滚；附件路径越界在提交前就拒（不拿半截账换一篇删不掉的笔记）。
     pub fn delete_note(&mut self, root: &Root, expected: &NoteRow) -> Res<Option<DeletedNote>> {
         let tx = self.conn.transaction().es()?;
         let sql = format!("SELECT {NOTE_COLUMNS} FROM notes WHERE id=?1");
@@ -446,13 +495,17 @@ impl Db {
         } else {
             Some(root.resolve(&current.body_path)?)
         };
-        let mut stmt = tx.prepare("SELECT rel_path FROM note_assets WHERE note_id=?1 ORDER BY rowid").es()?;
-        let rows = stmt.query_map(params![current.id], |row| row.get::<_, String>(0)).es()?;
+        let assets = asset_rows_on(&tx, current.id)?;
         let mut asset_paths = Vec::new();
-        for rel in rows {
-            asset_paths.push(root.resolve(&rel.es()?)?);
+        for asset in &assets {
+            asset_paths.push(root.resolve(&asset.rel_path)?);
         }
-        drop(stmt);
+        let orphaned_at = now_ms();
+        for asset in &assets {
+            if owned_asset_rel(&current, asset).is_some() {
+                register_orphan_on(&tx, &asset.rel_path, orphaned_at)?;
+            }
+        }
         tx.execute("DELETE FROM note_assets WHERE note_id=?1", params![current.id]).es()?;
         let changed = tx.execute(
             "DELETE FROM notes WHERE id=?1 AND kind=?2 AND folder_id=?3 AND enc=?4 AND body_path=?5",
@@ -467,10 +520,207 @@ impl Db {
         if let Some(path) = &body_path {
             remove_deleted_file(path, "正文", &mut warnings);
         }
-        for path in &asset_paths {
-            remove_deleted_file(path, "附件", &mut warnings);
-        }
         Ok(Some(DeletedNote { body_path, asset_paths, warnings }))
+    }
+
+    /// 一次启动附件扫收（P2）：只清「形状确认为插件自有 ＋ 确认无引用 ＋ 已过 [`ASSET_ORPHAN_GRACE_MS`]」的副本。
+    /// 未知名字、临时文件、目录／符号链接、判不出年龄的一律留盘；删除失败**保留宽限账**，下一趟再试。
+    pub fn sweep_expired_assets(&self, root: &Root, now: i64) -> Res<AssetSweepReport> {
+        let mut report = AssetSweepReport::default();
+        // 候选 = 宽限账 ∪ 盘上合法但没落账的旧副本（账里那条时间优先，盘上时间只兜底）。
+        let mut candidates: std::collections::BTreeMap<String, Option<i64>> = std::collections::BTreeMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT rel_path, orphaned_at_ms FROM nomo_asset_orphans")
+                .es()?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .es()?;
+            for row in rows {
+                let (rel, at) = row.es()?;
+                candidates.insert(rel, Some(at));
+            }
+        }
+        let live = self.live_asset_paths()?;
+        for rel in self.disk_asset_candidates(root, &mut report) {
+            candidates.entry(rel).or_insert(None);
+        }
+        let mut bodies: HashMap<String, Vec<String>> = HashMap::new();
+        for (rel, ledger_at) in candidates {
+            if !plugin_asset_rel(&rel) {
+                // 账里躺着一格不认识的形状：既不删文件也不销账，留给人看。
+                report.refused += 1;
+                continue;
+            }
+            if live.contains(rel.as_str()) {
+                report.referenced += 1;
+                self.drop_orphan_row(&rel)?;
+                continue;
+            }
+            let path = match root.resolve(&rel) {
+                Ok(path) => path,
+                Err(_) => {
+                    report.refused += 1;
+                    continue;
+                }
+            };
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // 盘上本就没有：这格账结了，顺带清掉指向它的残留索引行。
+                    report.removed += 1;
+                    self.drop_orphan_row(&rel)?;
+                    self.forget_orphaned_index_rows(&rel)?;
+                    continue;
+                }
+                Err(_) => {
+                    report.refused += 1;
+                    continue;
+                }
+            };
+            if !metadata.is_file() {
+                report.unrecognized += 1;
+                continue;
+            }
+            let dir = rel.split('/').nth(1).unwrap_or_default();
+            if !bodies.contains_key(dir) {
+                match self.folder_bodies(root, dir) {
+                    Ok(rows) => {
+                        bodies.insert(dir.to_string(), rows);
+                    }
+                    // 读不动那一夹的正文就没法确认引用 ⇒ 宁可不删。
+                    Err(_) => {
+                        report.refused += 1;
+                        continue;
+                    }
+                }
+            }
+            let name = rel.rsplit('/').next().unwrap_or_default();
+            let asset = candidate_asset_row(name.split('.').next().unwrap_or_default(), &rel);
+            if bodies[dir].iter().any(|body| body_references_asset(body, &asset)) {
+                report.referenced += 1;
+                self.drop_orphan_row(&rel)?;
+                continue;
+            }
+            let Some(age) = ledger_at.or_else(|| modified_ms(&metadata)) else {
+                report.refused += 1;
+                continue;
+            };
+            if now - age < ASSET_ORPHAN_GRACE_MS {
+                report.kept_young += 1;
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    report.failed += 1;
+                    continue;
+                }
+            }
+            report.removed += 1;
+            self.drop_orphan_row(&rel)?;
+            self.forget_orphaned_index_rows(&rel)?;
+        }
+        Ok(report)
+    }
+
+    /// 仍挂在活笔记上的附件路径（索引在＝有人在用，私密那一格也靠它护着，不去读正文）。
+    fn live_asset_paths(&self) -> Res<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rel_path FROM note_assets WHERE note_id IN (SELECT id FROM notes)")
+            .es()?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).es()?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row.es()?);
+        }
+        Ok(out)
+    }
+
+    /// 那个文件夹里**公开**正文的当前内容（对引用用；私密正文不读，其附件由 `note_assets` 行保护）。
+    fn folder_bodies(&self, root: &Root, dir: &str) -> Res<Vec<String>> {
+        let prefix = format!("{FOLDERS_DIR}/{dir}/{NOTES_SUBDIR}/");
+        let mut paths = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT body_path FROM notes WHERE kind='note' AND enc=0")
+                .es()?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).es()?;
+            for row in rows {
+                let body_path = row.es()?;
+                if let Some(name) = body_path.strip_prefix(&prefix) {
+                    if !name.is_empty() && !name.contains('/') {
+                        paths.push(body_path);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for body_path in paths {
+            let abs = root.resolve(&body_path)?;
+            if let Ok(raw) = std::fs::read_to_string(&abs) {
+                out.push(note_text(&raw));
+            }
+        }
+        Ok(out)
+    }
+
+    /// 盘上扫 `folders/<dir>/notes/a/`：认不出的名字（临时文件、别家副本、目录）只计数、不碰。
+    fn disk_asset_candidates(&self, root: &Root, report: &mut AssetSweepReport) -> Vec<String> {
+        let mut rels = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root.path().join(FOLDERS_DIR)) else {
+            return rels;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.file_name().to_string_lossy().to_string();
+            if !entry.path().is_dir() || check_dir_name(&dir).is_err() {
+                continue;
+            }
+            let assets = root
+                .path()
+                .join(FOLDERS_DIR)
+                .join(&dir)
+                .join(NOTES_SUBDIR)
+                .join("a");
+            let Ok(files) = std::fs::read_dir(assets) else { continue };
+            for file in files.flatten() {
+                let name = file.file_name().to_string_lossy().to_string();
+                if name.contains('/') || name.contains('\\') {
+                    report.unrecognized += 1;
+                    continue;
+                }
+                let rel = format!("{FOLDERS_DIR}/{dir}/{NOTES_SUBDIR}/a/{name}");
+                if plugin_asset_rel(&rel) {
+                    rels.push(rel);
+                } else {
+                    report.unrecognized += 1;
+                }
+            }
+        }
+        rels
+    }
+
+    fn drop_orphan_row(&self, rel: &str) -> Res<()> {
+        self.conn
+            .execute("DELETE FROM nomo_asset_orphans WHERE rel_path=?1", params![rel])
+            .es()?;
+        Ok(())
+    }
+
+    /// 文件已回收，指向它的残留索引行（笔记早没了那种旧形状）一并清掉；活笔记的行不在这里动。
+    fn forget_orphaned_index_rows(&self, rel: &str) -> Res<()> {
+        self.conn
+            .execute(
+                "DELETE FROM note_assets WHERE rel_path=?1 \
+                 AND note_id NOT IN (SELECT id FROM notes)",
+                params![rel],
+            )
+            .es()?;
+        Ok(())
     }
 
     /// 只读点查标题（op `notes.info` 用）：**不建库、不迁移、不设 WAL**，只 `SELECT title, enc`。
@@ -636,6 +886,123 @@ fn put_asset_on(conn: &Connection, asset: &AssetRow) -> Res<()> {
     )
     .es()?;
     Ok(())
+}
+
+fn read_asset(r: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
+    let kind_word: String = r.get(2)?;
+    let source_word: String = r.get(4)?;
+    Ok(AssetRow {
+        id: r.get(0)?,
+        note_id: r.get(1)?,
+        kind: if kind_word == AssetKind::Gif.as_str() { AssetKind::Gif } else { AssetKind::Image },
+        rel_path: r.get(3)?,
+        source_kind: match source_word.as_str() {
+            "pin" => SourceKind::Pin,
+            "gif" => SourceKind::Gif,
+            _ => SourceKind::File,
+        },
+        source_ref: r.get(5)?,
+        bytes: r.get::<_, i64>(6)?.max(0) as u64,
+        width: r.get(7)?,
+        height: r.get(8)?,
+        frames: r.get(9)?,
+        duration_ms: r.get(10)?,
+        sha256: r.get(11)?,
+        created_at_ms: r.get(12)?,
+    })
+}
+
+/// 某篇笔记已登记的附件行（列序照 [`ASSET_COLUMNS`]，`ORDER BY rowid` 保宿主写入序）。
+fn asset_rows_on(conn: &Connection, note_id: i64) -> Res<Vec<AssetRow>> {
+    let sql = format!("SELECT {ASSET_COLUMNS} FROM note_assets WHERE note_id=?1 ORDER BY rowid");
+    let mut stmt = conn.prepare(&sql).es()?;
+    let rows = stmt.query_map(params![note_id], read_asset).es()?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.es()?);
+    }
+    Ok(out)
+}
+
+/// 记一条宽限账：同一格只认**首次**失引时刻，重复登记不续期（否则反复保存会把该收的副本一直养着）。
+fn register_orphan_on(conn: &Connection, rel: &str, orphaned_at_ms: i64) -> Res<()> {
+    conn.execute(
+        "INSERT INTO nomo_asset_orphans (rel_path, orphaned_at_ms) VALUES (?1, ?2) \
+         ON CONFLICT(rel_path) DO NOTHING",
+        params![rel, orphaned_at_ms],
+    )
+    .es()?;
+    Ok(())
+}
+
+/// 附件行的词法归属闸：只有「当前正文旁的 `a/<id>.<扩展名>`、文件名就是那颗 id」才算**插件自有**副本。
+/// 认不出一律 `None`——不 canonicalize、不猜归属，别家的落点不进回收账。
+fn owned_asset_rel(note: &NoteRow, asset: &AssetRow) -> Option<String> {
+    if asset.note_id != note.id {
+        return None;
+    }
+    let parent = note.body_path.rsplit_once('/')?.0;
+    let name = asset.rel_path.strip_prefix(&format!("{parent}/a/"))?;
+    let (id, extension) = name.split_once('.')?;
+    if id != asset.id || !is_lower_hex(id, 16) || !valid_asset_extension(extension) {
+        return None;
+    }
+    Some(asset.rel_path.clone())
+}
+
+/// 扫收用的归属闸（手上只有相对路径时）：`folders/<dir>/notes/a/<32 位 hex>.<扩展名>`。
+fn plugin_asset_rel(rel: &str) -> bool {
+    let segments: Vec<&str> = rel.split('/').collect();
+    if segments.len() != 5
+        || segments[0] != FOLDERS_DIR
+        || segments[2] != NOTES_SUBDIR
+        || segments[3] != "a"
+    {
+        return false;
+    }
+    if check_dir_name(segments[1]).is_err() {
+        return false;
+    }
+    let Some((id, extension)) = segments[4].split_once('.') else {
+        return false;
+    };
+    is_lower_hex(id, 16) && valid_asset_extension(extension)
+}
+
+fn valid_asset_extension(extension: &str) -> bool {
+    !extension.is_empty()
+        && extension.len() <= 8
+        && extension
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+/// 扫收候选的年龄：没落账的旧副本回落到盘上时间（读不出就如实当「判不了年龄」）。
+fn modified_ms(metadata: &std::fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_millis() as i64)
+}
+
+/// 拿附件 id 拼一条只为对引用用的假行：[`body_references_asset`] 只读 `id` 与 `rel_path` 的扩展名。
+fn candidate_asset_row(id: &str, rel: &str) -> AssetRow {
+    AssetRow {
+        id: id.to_string(),
+        note_id: 0,
+        kind: AssetKind::Image,
+        rel_path: rel.to_string(),
+        source_kind: SourceKind::File,
+        source_ref: String::new(),
+        bytes: 0,
+        width: None,
+        height: None,
+        frames: None,
+        duration_ms: None,
+        sha256: String::new(),
+        created_at_ms: 0,
+    }
 }
 
 fn is_lower_hex(value: &str, bytes: usize) -> bool {
@@ -804,6 +1171,10 @@ fn migrate(conn: &Connection, found: i32) -> rusqlite::Result<()> {
     if !table_exists(conn, "note_assets")? {
         conn.execute_batch(ASSETS_DDL)?;
         conn.execute_batch(ASSETS_INDEX_DDL)?;
+    }
+    // 宽限账是插件自己的表：建不建都不动 `user_version`，宿主那边看到的仍是核心 schema 2。
+    if !table_exists(conn, "nomo_asset_orphans")? {
+        conn.execute_batch(ASSET_ORPHANS_DDL)?;
     }
     if found != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1133,13 +1504,57 @@ mod tests {
         tempfile::Builder::new().prefix(&format!("nomo-plugin-{tag}")).tempdir().unwrap()
     }
 
-    fn insert_asset(db: &Db, note_id: i64, rel_path: &str) {
+    fn insert_asset(db: &Db, note_id: i64, id: &str, rel_path: &str) {
         db.conn.execute(
             "INSERT INTO note_assets \
              (id, note_id, kind, rel_path, source_kind, source_ref, bytes, width, height, frames, duration_ms, sha256, created_at_ms) \
              VALUES (?1, ?2, 'image', ?3, 'file', '', 1, NULL, NULL, NULL, NULL, 'x', 1)",
-            params![format!("asset-{note_id}"), note_id, rel_path],
+            params![id, note_id, rel_path],
         ).unwrap();
+    }
+
+    fn orphan_count(db: &Db) -> i64 {
+        db.conn.query_row("SELECT COUNT(*) FROM nomo_asset_orphans", [], |r| r.get(0)).unwrap()
+    }
+
+    fn orphan_ledger(db: &Db, rel: &str) -> Option<i64> {
+        db.conn.query_row(
+            "SELECT orphaned_at_ms FROM nomo_asset_orphans WHERE rel_path=?1",
+            [rel],
+            |r| r.get(0),
+        ).ok()
+    }
+
+    fn book_orphan(db: &Db, rel: &str, at: i64) {
+        db.conn.execute(
+            "INSERT INTO nomo_asset_orphans (rel_path, orphaned_at_ms) VALUES (?1, ?2)",
+            params![rel, at],
+        ).unwrap();
+    }
+
+    /// 造一颗形状合法的附件行（id 是 32 位小写 hex，落点就在正文旁边的 `a/`）。
+    fn written_asset(root: &Root, dir: &str, note_id: i64, seed: u8) -> (String, AssetRow) {
+        let id = format!("{:02x}", seed).repeat(16);
+        let rel = format!("folders/{dir}/notes/a/{id}.png");
+        let path = root.resolve(&rel).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"png").unwrap();
+        let row = AssetRow {
+            id: id.clone(),
+            note_id,
+            kind: AssetKind::Image,
+            rel_path: rel.clone(),
+            source_kind: SourceKind::File,
+            source_ref: String::new(),
+            bytes: 3,
+            width: None,
+            height: None,
+            frames: None,
+            duration_ms: None,
+            sha256: "c".repeat(64),
+            created_at_ms: 1,
+        };
+        (rel, row)
     }
 
     #[test]
@@ -1156,6 +1571,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(found, SCHEMA_VERSION);
+        assert!(table_exists(&conn.conn, "nomo_asset_orphans").unwrap(), "宽限账要随开库建出来");
+        assert_eq!(found, 2, "插件扩展表不升宿主核心 schema 版本");
     }
 
     #[test]
@@ -1264,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_note_cascades_assets_and_removes_files_idempotently() {
+    fn delete_note_keeps_assets_for_the_grace_window_and_sweep_finishes_the_job() {
         let d = temp_dir("delete");
         let db_path = d.path().join("notes.db");
         let mut db = Db::open(&db_path).unwrap();
@@ -1272,23 +1689,27 @@ mod tests {
         let row = db.create_note(&root, "inbox", 7).unwrap();
         let body = root.resolve(&row.body_path).unwrap();
         std::fs::write(&body, "# 待删\n").unwrap();
-        let asset_rel = format!("folders/inbox/notes/a/{}.png", row.id);
-        let asset = root.resolve(&asset_rel).unwrap();
-        std::fs::create_dir_all(asset.parent().unwrap()).unwrap();
-        std::fs::write(&asset, b"png").unwrap();
-        insert_asset(&db, row.id, &asset_rel);
+        let (asset_rel, asset) = written_asset(&root, "inbox", row.id, 0xa1);
+        insert_asset(&db, row.id, &asset.id, &asset.rel_path);
 
         let deleted = db.delete_note(&root, &row).unwrap().expect("第一次删除该命中");
         assert!(deleted.warnings.is_empty(), "{:?}", deleted.warnings);
-        assert!(!body.exists());
-        assert!(!asset.exists());
+        assert!(!body.exists(), "正文仍在数据库提交后立即删");
+        assert!(root.resolve(&asset_rel).unwrap().exists(), "附件留在盘上等宽限期，不当场删");
         assert!(db.note(row.id).unwrap().is_none());
-        let assets: i64 = db.conn.query_row(
-            "SELECT COUNT(*) FROM note_assets WHERE note_id=?1", [row.id], |r| r.get(0),
-        ).unwrap();
-        assert_eq!(assets, 0);
+        assert_eq!(asset_count(&db, row.id), 0, "索引行仍随笔记一并清掉");
+        assert!(orphan_ledger(&db, &asset_rel).is_some(), "删除要把附件退成宽限账");
         assert!(db.delete_note(&root, &row).unwrap().is_none(), "第二次删除应幂等");
         assert!(body.parent().unwrap().is_dir(), "删除单篇笔记不裁剪目录");
+
+        let young = db.sweep_expired_assets(&root, now_ms()).unwrap();
+        assert_eq!((young.kept_young, young.removed), (1, 0), "{young:?}");
+        assert!(root.resolve(&asset_rel).unwrap().exists(), "宽限期内一颗都不许少");
+
+        let aged = db.sweep_expired_assets(&root, now_ms() + ASSET_ORPHAN_GRACE_MS).unwrap();
+        assert_eq!((aged.removed, aged.kept_young), (1, 0), "{aged:?}");
+        assert!(root.resolve(&asset_rel).unwrap().symlink_metadata().is_err(), "过期无引用的副本该被回收");
+        assert_eq!(orphan_count(&db), 0, "回收成功的账要一并结掉");
     }
 
     #[test]
@@ -1299,11 +1720,8 @@ mod tests {
         let row = db.create_note(&root, "inbox", 7).unwrap();
         let body = root.resolve(&row.body_path).unwrap();
         std::fs::write(&body, "keep").unwrap();
-        let asset_rel = format!("folders/inbox/notes/a/{}.png", row.id);
-        let asset = root.resolve(&asset_rel).unwrap();
-        std::fs::create_dir_all(asset.parent().unwrap()).unwrap();
-        std::fs::write(&asset, b"keep").unwrap();
-        insert_asset(&db, row.id, &asset_rel);
+        let (asset_rel, asset) = written_asset(&root, "inbox", row.id, 0xb2);
+        insert_asset(&db, row.id, &asset.id, &asset.rel_path);
         db.conn.execute_batch(
             "CREATE TRIGGER reject_note_delete BEFORE DELETE ON notes \
              BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
@@ -1315,8 +1733,9 @@ mod tests {
             "SELECT COUNT(*) FROM note_assets WHERE note_id=?1", [row.id], |r| r.get(0),
         ).unwrap();
         assert_eq!(assets, 1);
+        assert_eq!(orphan_count(&db), 0, "整趟回滚不能留下半截宽限账");
         assert!(body.exists());
-        assert!(asset.exists());
+        assert!(root.resolve(&asset_rel).unwrap().exists());
     }
 
     #[test]
@@ -1326,10 +1745,11 @@ mod tests {
         let root = Root::open(d.path()).unwrap();
         let row = db.create_note(&root, "inbox", 7).unwrap();
         let body = root.resolve(&row.body_path).unwrap();
-        insert_asset(&db, row.id, "../outside.png");
+        insert_asset(&db, row.id, &"c3".repeat(16), "../outside.png");
 
         assert!(db.delete_note(&root, &row).is_err());
         assert!(db.note(row.id).unwrap().is_some());
+        assert_eq!(orphan_count(&db), 0, "越界路径不能先进账再回滚");
         assert!(body.exists());
     }
 
@@ -1429,6 +1849,7 @@ mod tests {
 
         db.save_note_with_assets(&mut row, &body, &root, &[referenced.clone(), bare, lookalike]).unwrap();
         assert_eq!(asset_count(&db, row.id), 1);
+        assert_eq!(orphan_count(&db), 2, "正文没引用的那两颗要落宽限账，等扫收回收");
         let saved: String = db.conn.query_row(
             "SELECT id FROM note_assets WHERE note_id=?1",
             [row.id],
@@ -1497,6 +1918,147 @@ mod tests {
         assert!(db.save_note_with_assets(&mut row, &body, &root, &[asset]).is_err());
         assert_eq!(asset_count(&db, row.id), 0);
         assert_eq!(db.note(row.id).unwrap().unwrap().title, None);
+    }
+
+    #[test]
+    fn save_books_a_dereferenced_asset_without_touching_the_file() {
+        let d = temp_dir("asset-orphan");
+        let mut db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let mut row = db.create_note(&root, "inbox", 7).unwrap();
+        let asset = asset_file(&root, &row, &"a7".repeat(16), b"bytes");
+        db.save_note_with_assets(
+            &mut row,
+            &format!("# 图\n\n![图](a/{}.png)", asset.id),
+            &root,
+            &[asset.clone()],
+        ).unwrap();
+        assert_eq!(asset_count(&db, row.id), 1);
+        assert_eq!(orphan_count(&db), 0, "还在用的那颗不该进宽限账");
+
+        db.save_note_with_assets(&mut row, "# 图\n\n正文里没图了", &root, &[asset.clone()]).unwrap();
+        assert_eq!(asset_count(&db, row.id), 0, "失去引用的索引行要退账");
+        assert!(orphan_ledger(&db, &asset.rel_path).is_some(), "退账不等于删文件");
+        assert!(root.resolve(&asset.rel_path).unwrap().exists());
+
+        // 首次失引时刻只认一次：反复保存不许给这一格续期。
+        let first = orphan_ledger(&db, &asset.rel_path).unwrap();
+        db.save_note_with_assets(&mut row, "# 图\n\n正文里没图了", &root, &[asset.clone()]).unwrap();
+        assert_eq!(orphan_ledger(&db, &asset.rel_path).unwrap(), first, "重复失引不续期");
+    }
+
+    #[test]
+    fn sweep_only_removes_expired_unreferenced_plugin_copies() {
+        let d = temp_dir("sweep");
+        let mut db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let mut live = db.create_note(&root, "inbox", 7).unwrap();
+        let referenced = asset_file(&root, &live, &"11".repeat(16), b"in-use");
+        // 正文引用它、索引行却没有：只有"读那一夹公开正文"这一条护得住。
+        let body_only = asset_file(&root, &live, &"99".repeat(16), b"body-only");
+        // 扫收读的是盘上正文（正式链路里会话先写盘，适配层再落索引）。
+        let disk_body = format!("# 活的\n\n![图](a/{}.png)\n![二](a/{}.png)", referenced.id, body_only.id);
+        std::fs::write(root.resolve(&live.body_path).unwrap(), &disk_body).unwrap();
+        db.save_note_with_assets(&mut live, &disk_body, &root, &[referenced.clone()]).unwrap();
+        // 索引行还在、正文已经不再引用：只有 `note_assets` 那一条护得住。
+        let indexed_only = asset_file(&root, &live, &"88".repeat(16), b"indexed-only");
+        insert_asset(&db, live.id, &indexed_only.id, &indexed_only.rel_path);
+        let now = now_ms();
+        let later = now + ASSET_ORPHAN_GRACE_MS + 60_000;
+
+        // ① 过期、无引用、形状合法 ⇒ 该回收。
+        let (expired_rel, _) = written_asset(&root, "inbox", live.id, 0x22);
+        book_orphan(&db, &expired_rel, now - ASSET_ORPHAN_GRACE_MS - 1_000);
+        // ② 宽限期没过 ⇒ 一颗都不许少。
+        let (young_rel, _) = written_asset(&root, "inbox", live.id, 0x33);
+        book_orphan(&db, &young_rel, now + ASSET_ORPHAN_GRACE_MS / 2);
+        // ③ 旧版本遗留：盘上有、账上没有，年龄回落到盘上时间。
+        let (bare_rel, _) = written_asset(&root, "inbox", live.id, 0x44);
+        // ④ 认不出的名字与占着那个位置的目录：只计数、不碰。
+        let stray = root.resolve("folders/inbox/notes/a/stray.txt").unwrap();
+        std::fs::write(&stray, b"stray").unwrap();
+        let boxed = root.resolve(&format!("folders/inbox/notes/a/{}.png", "55".repeat(16))).unwrap();
+        std::fs::create_dir_all(&boxed).unwrap();
+        // ⑤ 账里躺着一格形状不合法的：既不删文件也不销账。
+        let ragged_rel = "folders/inbox/notes/a/not-hex.png".to_string();
+        let ragged = root.resolve(&ragged_rel).unwrap();
+        std::fs::write(&ragged, b"ragged").unwrap();
+        book_orphan(&db, &ragged_rel, now - ASSET_ORPHAN_GRACE_MS - 1_000);
+
+        let report = db.sweep_expired_assets(&root, later).unwrap();
+        assert_eq!(
+            report,
+            AssetSweepReport {
+                removed: 2,
+                kept_young: 1,
+                referenced: 3,
+                unrecognized: 3,
+                refused: 1,
+                failed: 0,
+            },
+            "{report:?}"
+        );
+        let gone = |rel: &str| root.resolve(rel).unwrap().symlink_metadata().is_err();
+        assert!(gone(&expired_rel), "过期无引用的副本该被回收");
+        assert!(gone(&bare_rel), "盘上时间也算得出年龄");
+        assert!(!gone(&young_rel), "宽限期内的副本必须还在");
+        assert!(!gone(&referenced.rel_path), "仍被正文与索引引用的副本不能动");
+        assert!(!gone(&body_only.rel_path), "正文引用、索引没落行的那颗也得护住");
+        assert!(!gone(&indexed_only.rel_path), "索引有行、正文已不引用的那颗也得护住");
+        assert!(stray.exists(), "认不出的名字只计数");
+        assert!(boxed.is_dir(), "占着附件名的目录不是我们的副本");
+        assert!(ragged.exists(), "坏形状既不删也不销账");
+        assert_eq!(orphan_ledger(&db, &young_rel), Some(now + ASSET_ORPHAN_GRACE_MS / 2));
+        assert!(orphan_ledger(&db, &ragged_rel).is_some());
+        assert_eq!(orphan_count(&db), 2, "回收成功与仍年轻的结了账，剩下的留着");
+
+        let second = db.sweep_expired_assets(&root, later).unwrap();
+        assert_eq!(second.removed, 0, "同一趟扫收不该重复计数");
+        assert_eq!(second.refused, 1, "坏形状那一格每趟都会如实报");
+    }
+
+    #[test]
+    fn sweep_clears_the_ledger_row_and_a_stale_index_row_together() {
+        let d = temp_dir("sweep-stale");
+        let mut db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let row = db.create_note(&root, "inbox", 7).unwrap();
+        let (rel, asset) = written_asset(&root, "inbox", row.id, 0x66);
+        // 旧版本形状：笔记行早没了，索引行与文件都还留着，也没落账。
+        db.conn.execute("DELETE FROM notes WHERE id=?1", [row.id]).unwrap();
+        insert_asset(&db, asset.note_id, &asset.id, &asset.rel_path);
+
+        let report = db.sweep_expired_assets(&root, now_ms() + ASSET_ORPHAN_GRACE_MS + 60_000).unwrap();
+        assert_eq!((report.removed, report.referenced), (1, 0), "{report:?}");
+        assert!(root.resolve(&rel).unwrap().symlink_metadata().is_err());
+        assert_eq!(asset_count(&db, asset.note_id), 0, "文件回收后残留索引行一并清掉");
+        assert_eq!(orphan_count(&db), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sweep_keeps_the_ledger_when_the_file_refuses_to_go_away() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = temp_dir("sweep-failed");
+        let db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let (rel, _) = written_asset(&root, "inbox", 7, 0x77);
+        book_orphan(&db, &rel, now_ms() - ASSET_ORPHAN_GRACE_MS - 1_000);
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(root.resolve(&rel).unwrap())
+            .unwrap();
+
+        let report = db.sweep_expired_assets(&root, now_ms()).unwrap();
+        assert_eq!((report.failed, report.removed), (1, 0), "{report:?}");
+        assert!(orphan_ledger(&db, &rel).is_some(), "删不掉要留账，下一趟再试");
+        assert!(root.resolve(&rel).unwrap().exists());
+
+        drop(held);
+        let retry = db.sweep_expired_assets(&root, now_ms()).unwrap();
+        assert_eq!((retry.removed, retry.failed), (1, 0), "{retry:?}");
+        assert_eq!(orphan_count(&db), 0);
     }
 
     #[test]

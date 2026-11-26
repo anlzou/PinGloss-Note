@@ -39,7 +39,7 @@ use crate::nomo_mark::{
 use crate::plugin::dispatch::Dispatch;
 use crate::plugin::endpoints::Endpoints;
 use crate::plugin::session::{Identity, RequestError, Server, Session};
-use crate::plugin::storage::{derive_title, first_line, note_text, Db, NoteKind, NoteRow, Root};
+use crate::plugin::storage::{derive_title, first_line, note_text, now_ms, Db, NoteKind, NoteRow, Root};
 
 const PLUGIN_DISPLAY_NAME: &str = "PinGloss-Note x Nomo";
 use crate::text_document::markdown_session::{
@@ -402,6 +402,8 @@ struct Engine {
     /// 在 `handle` 里只**记账**、不直接发——发要靠 `serve` 那一侧的 `session`，而 `handle` 拿不到它。
     /// `serve` 的泵每办成一条就把这一格取走、`request` 出去；没接（旧宿主／缺权限）也不留，2 s TTL 兜底。
     pending_change: Option<Value>,
+    /// 已经扫过附件宽限账的那一层正文根；宿主每次快照都会推一遍，全盘扫描只在每个根上跑一次。
+    swept_root: Option<PathBuf>,
     /// 生产泵与界面共享同一会话服务，改名可在正式路径锁内更新已打开文档的基线。
     sessions: Option<MarkdownDocumentSessionManager>,
 }
@@ -459,6 +461,7 @@ impl Engine {
                 if skin.is_some() || locale.is_some() {
                     sink(UiCommand::HostAppearanceChanged { skin, locale });
                 }
+                self.sweep_assets_once();
                 sink(UiCommand::FoldersChanged);
                 Dispatch::Done(json!({ "ok": true }))
             }
@@ -886,6 +889,35 @@ impl Engine {
         Ok(DeleteOutcome { deleted: true, warnings: deleted.warnings })
     }
 
+    /// 绑上正文根之后扫一趟附件宽限账（P2）：只清过期、合法、确认无引用的副本。
+    ///
+    /// 一个根在这一格连接里至多扫一次——宿主每次快照都会推同一份 root，不能把全盘扫描挂在快照上。
+    /// 扫收失败**不挡插件启动**：正文与附件都还在，最多晚一轮回收，如实记一句就往后再试。
+    fn sweep_assets_once(&mut self) {
+        let Some(path) = self.root_path.clone() else { return };
+        if self.swept_root.as_deref() == Some(path.as_path()) {
+            return;
+        }
+        let Ok(root) = Root::open(&path) else { return };
+        match self.db.sweep_expired_assets(&root, now_ms()) {
+            Ok(report) => {
+                self.swept_root = Some(path);
+                if report.removed + report.failed > 0 {
+                    eprintln!(
+                        "附件宽限扫收：回收 {}、年轻保留 {}、引用中 {}、未知 {}、拒绝 {}、失败 {}",
+                        report.removed,
+                        report.kept_young,
+                        report.referenced,
+                        report.unrecognized,
+                        report.refused,
+                        report.failed
+                    );
+                }
+            }
+            Err(error) => eprintln!("附件宽限扫收失败（不影响这一趟使用）：{error}"),
+        }
+    }
+
     /// 攒一条待推的 `host.notes_changed`（§4.3 P3b）：载荷 `{folder, note_id, kind, title?}`，字段名照文档那一格。
     /// 只**记账**、不在 `handle` 里发（那里拿不到 `session`）——发由 [`serve`] 的泵在 `handle` 返回后做。
     /// 一条接一个：后一条盖过前一条（2 s TTL 还在兜底，推漏一条只是退化成今天的时延）。
@@ -931,6 +963,7 @@ fn serve_loop(
         open_notes: HashSet::new(),
         folders: Vec::new(),
         pending_change: None,
+        swept_root: None,
         sessions,
     };
     loop {
@@ -2700,8 +2733,65 @@ mod tests {
             open_notes: HashSet::new(),
             folders: Vec::new(),
             pending_change: None,
+            swept_root: None,
             sessions: None,
         }
+    }
+
+    /// 绑根那一趟要把过期副本回收掉，宽限期内的不动；同一个根不重扫第二遍（宿主每次快照都会推同一份 root）。
+    #[test]
+    fn host_snapshot_sweeps_expired_attachments_once_per_root() {
+        let data = tempfile::Builder::new().prefix("nomo-rt-sweep-db").tempdir().unwrap();
+        let root = tempfile::Builder::new().prefix("nomo-rt-sweep-root").tempdir().unwrap();
+        let mut engine = engine(&data.path().join("notes.db"));
+        let root_handle = Root::open(root.path()).unwrap();
+        let row = engine.db.create_note(&root_handle, "inbox", 7).unwrap();
+        let parent = row.body_path.rsplit_once('/').unwrap().0;
+        let aged_rel = format!("{parent}/a/{}.png", "ab".repeat(16));
+        let young_rel = format!("{parent}/a/{}.png", "cd".repeat(16));
+        for rel in [&aged_rel, &young_rel] {
+            let path = root_handle.resolve(rel).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"bytes").unwrap();
+        }
+        let aged_at = now_ms() - crate::plugin::storage::ASSET_ORPHAN_GRACE_MS - 1_000;
+        {
+            let book = rusqlite::Connection::open(&engine.db_path).unwrap();
+            book.execute(
+                "INSERT INTO nomo_asset_orphans (rel_path, orphaned_at_ms) VALUES (?1, ?2)",
+                rusqlite::params![aged_rel, aged_at],
+            ).unwrap();
+            book.execute(
+                "INSERT INTO nomo_asset_orphans (rel_path, orphaned_at_ms) VALUES (?1, ?2)",
+                rusqlite::params![young_rel, now_ms()],
+            ).unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let payload = json!({ "root": root.path().to_string_lossy() });
+        let done = engine.handle("folders.snapshot", payload.clone(), &mut |command| seen.push(command));
+
+        assert_eq!(done, Dispatch::Done(json!({ "ok": true })));
+        assert!(
+            root_handle.resolve(&aged_rel).unwrap().symlink_metadata().is_err(),
+            "过期又没人引用的副本该在绑根那一趟被回收"
+        );
+        assert!(root_handle.resolve(&young_rel).unwrap().exists(), "宽限期内的副本一颗都不能少");
+        assert_eq!(engine.swept_root.as_deref(), Some(root.path()));
+
+        let late_rel = format!("{parent}/a/{}.png", "ef".repeat(16));
+        let late = root_handle.resolve(&late_rel).unwrap();
+        std::fs::write(&late, b"bytes").unwrap();
+        {
+            let book = rusqlite::Connection::open(&engine.db_path).unwrap();
+            book.execute(
+                "INSERT INTO nomo_asset_orphans (rel_path, orphaned_at_ms) VALUES (?1, ?2)",
+                rusqlite::params![late_rel, aged_at],
+            ).unwrap();
+        }
+        engine.handle("folders.snapshot", payload, &mut |command| seen.push(command));
+        assert!(late.exists(), "同一个根不该重扫，否则每趟快照都挂一次全盘扫描");
+        assert!(seen.iter().filter(|command| matches!(command, UiCommand::FoldersChanged)).count() >= 2);
     }
 
     fn appearance_payload(root: &Path) -> Value {
