@@ -129,6 +129,27 @@ impl Listener {
     }
 }
 
+#[cfg(any(unix, test))]
+fn poll_unix(
+    mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+    framer: &mut Framer,
+) -> std::io::Result<bool> {
+    let mut buf = [0u8; READ_CHUNK];
+    loop {
+        match read(&mut buf) {
+            Ok(0) => return Ok(false),
+            Ok(n) => {
+                framer.push(&buf[..n]);
+                // 对端可持续写满；先交回调用方执行帧上限检查。
+                return Ok(true);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl Stream {
     /// 宿主侧拨进去（判据/自检里模拟宿主时才用；Nomo 作为插件走 [`Listener::accept`]）。
     pub fn connect(path: &Path, budget: Duration) -> Res<Self> {
@@ -160,22 +181,9 @@ impl Stream {
     pub fn poll(&mut self) -> Res<bool> {
         #[cfg(unix)]
         {
-            let mut buf = [0u8; READ_CHUNK];
-            loop {
-                match self.sock.read(&mut buf) {
-                    Ok(0) => return Ok(false), // EOF。
-                    Ok(n) => {
-                        self.framer.push(&buf[..n]);
-                        // 一次读尽量吸干净内核缓冲；再读若 WouldBlock 就收手（下一拍继续）。
-                        if n < READ_CHUNK {
-                            return Ok(true);
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
-                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
+            let sock = &mut self.sock;
+            let framer = &mut self.framer;
+            poll_unix(|buf| sock.read(buf), framer).map_err(|e| e.to_string())
         }
         #[cfg(windows)]
         {
@@ -301,6 +309,33 @@ impl Stream {
             // 没吸到完整帧就让出一点，别把 CPU 烧满（下一圈回到顶部再取）。
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+}
+
+#[cfg(test)]
+mod unix_poll_tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn a_full_read_yields_before_the_peer_runs_dry() {
+        let mut framer = Framer::default();
+        let mut reads = 0;
+        let open = poll_unix(
+            |_buf| {
+                reads += 1;
+                if reads == 1 {
+                    Ok(READ_CHUNK)
+                } else {
+                    Err(std::io::Error::from(ErrorKind::WouldBlock))
+                }
+            },
+            &mut framer,
+        )
+        .unwrap();
+        assert!(open);
+        assert_eq!(reads, 1, "满格读取后必须先交回调用方检查帧上限");
+        assert_eq!(framer.pending(), READ_CHUNK);
     }
 }
 
