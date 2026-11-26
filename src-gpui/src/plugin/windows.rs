@@ -1,7 +1,7 @@
 //! Windows 数据面：本机 named pipe 上的 JSON Lines 字节流。
 //!
 //! 插件是 server，宿主是 client。每只句柄都以 `FILE_FLAG_OVERLAPPED` 打开，接与读发出后按完成事件
-//! 非阻塞收取；写最多等 500ms，对端不吸字节时断开，不把插件泵线程或界面挂死。
+//! 非阻塞收取；写与取消收净共用调用方预算，对端不吸字节时及时收尾。
 
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
@@ -110,10 +110,22 @@ impl Op {
 }
 
 /// 取消并收净一条异步操作，之后内核不再引用它的堆块。
-fn reap(mut op: Op, handle: HANDLE) {
+fn reap(op: Op, handle: HANDLE) {
+    reap_until(
+        op,
+        handle,
+        Instant::now() + Duration::from_millis(CANCEL_WAIT_MS as u64),
+    );
+}
+
+fn reap_until(mut op: Op, handle: HANDLE, deadline: Instant) {
     unsafe {
         CancelIoEx(handle, std::ptr::addr_of!(*op.ov));
-        if op.done.wait_within(CANCEL_WAIT_MS) {
+        let wait_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(CANCEL_WAIT_MS as u128) as u32;
+        if op.done.wait_within(wait_ms) {
             let _ = op.result(handle);
         } else {
             std::mem::forget(op);
@@ -455,7 +467,7 @@ impl Stream {
             let this_wait = wait_ms.min(Duration::from_millis(WRITE_WAIT_MS as u64));
             let wait_ms = this_wait.as_millis().clamp(1, WRITE_WAIT_MS as u128) as u32;
             if !op.done.wait_within(wait_ms) {
-                reap(op, self.inner.0);
+                reap_until(op, self.inner.0, deadline);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("对端在 {wait_ms}ms 内没有吸完 pipe 字节"),
@@ -702,6 +714,18 @@ mod tests {
             .send_line_until(r#"{"ok":true}"#.to_string(), deadline)
             .unwrap();
         assert_eq!(host.wait_for_test(5), r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn a_cancellation_that_never_completes_stays_inside_the_deadline() {
+        let op = Op::new(None).unwrap();
+        let started = Instant::now();
+        reap_until(op, INVALID_HANDLE_VALUE, started + Duration::from_millis(30));
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "取消收净用了 {:?}，不能越过整帧写的截止时间",
+            started.elapsed()
+        );
     }
 
     #[test]
