@@ -40,6 +40,8 @@ use crate::plugin::dispatch::Dispatch;
 use crate::plugin::endpoints::Endpoints;
 use crate::plugin::session::{Identity, RequestError, Server, Session};
 use crate::plugin::storage::{derive_title, first_line, note_text, Db, NoteKind, NoteRow, Root};
+
+const PLUGIN_DISPLAY_NAME: &str = "PinGloss-Note x Nomo";
 use crate::text_document::markdown_session::{
     MarkdownDocumentSessionManager, RecoveryCandidate, RenameAttemptError, SessionLease,
 };
@@ -310,6 +312,7 @@ enum EngineCommand {
     SaveFinished {
         note_id: i64,
         path: PathBuf,
+        assets: Vec<crate::plugin::storage::AssetRow>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     NoteClosed {
@@ -340,6 +343,7 @@ pub fn probe() {
     let endpoints = Endpoints::from_env();
     let descriptor = json!({
         "app": "nomo",
+        "display_name": PLUGIN_DISPLAY_NAME,
         "plugin_id": "notes",
         "version": env!("CARGO_PKG_VERSION"),
         "mode": "probe",
@@ -756,8 +760,8 @@ impl Engine {
                 let result = self.prepare_save(note_id, &path).map(|_| ());
                 let _ = reply.send(result);
             }
-            EngineCommand::SaveFinished { note_id, path, reply } => {
-                let result = self.finish_save(note_id, &path);
+            EngineCommand::SaveFinished { note_id, path, assets, reply } => {
+                let result = self.finish_save(note_id, &path, &assets);
                 let _ = reply.send(result);
             }
             EngineCommand::NoteClosed { note_id } => {
@@ -810,7 +814,17 @@ impl Engine {
         Ok(())
     }
 
-    fn finish_save(&mut self, note_id: i64, path: &Path) -> crate::plugin::storage::Res<()> {
+    fn finish_save(
+        &mut self,
+        note_id: i64,
+        path: &Path,
+        assets: &[crate::plugin::storage::AssetRow],
+    ) -> crate::plugin::storage::Res<()> {
+        let root_path = self.note_roots.get(&note_id)
+            .map(PathBuf::as_path)
+            .or(self.root_path.as_deref())
+            .ok_or_else(|| "还没有绑定正文根，无法确认附件归属".to_string())?;
+        let root = Root::open(root_path)?;
         let mut row = self.note_for_save(note_id, path)?;
         let bytes = std::fs::metadata(path)
             .map_err(|error| format!("读取正文大小失败：{error}"))?
@@ -823,7 +837,7 @@ impl Engine {
         }
         let raw = std::fs::read_to_string(path)
             .map_err(|error| format!("读取已保存正文失败：{error}"))?;
-        self.db.save_note(&mut row, &note_text(&raw))?;
+        self.db.save_note_with_assets(&mut row, &note_text(&raw), &root, assets)?;
         self.note_changed(row.folder_id, row.id, "saved");
         Ok(())
     }
@@ -1403,7 +1417,12 @@ impl PluginWindow {
                 }
                 if self.note.as_ref().is_some_and(|note| note.note_id == note_id) {
                     if let Some(document) = self.document.clone() {
-                        document.update(cx, |host, cx| host.refresh_renamed_path(cx));
+                        document.update(cx, |host, cx| {
+                            host.refresh_renamed_path(cx);
+                            if let Err(error) = host.refresh_plugin_attachment_path(note_id, path.clone(), cx) {
+                                host.report(error, cx);
+                            }
+                        });
                     }
                     self.status = StatusMessage::text("plugin.status.renamed");
                     self.update_title(window, cx);
@@ -1782,9 +1801,21 @@ impl PluginWindow {
                 return;
             }
         };
+        let attachment_path = status.path.as_deref().map(PathBuf::from).unwrap_or_else(|| note.path.clone());
+        let attachments = match crate::plugin::attachments::PluginAttachmentConfig::for_note_path(note.note_id, &attachment_path) {
+            Ok(config) => config,
+            Err(error) => {
+                cx.background_executor()
+                    .spawn(async move { let _ = port.release_unmounted(); })
+                    .detach();
+                self.fail_open(note.note_id, error, cx);
+                return;
+            }
+        };
         let document = cx.new(|cx| {
             DocumentHost::workspace(port, adapter, status, ViewMode::Semantic, None, cx)
         });
+        document.update(cx, |host, cx| host.set_plugin_attachments(attachments, cx));
         if path_changed_during_open {
             document.update(cx, |host, cx| host.refresh_renamed_path(cx));
         }
@@ -2138,10 +2169,13 @@ impl PluginWindow {
     ) {
         self.saving = true;
         self.status = StatusMessage::text("plugin.status.updatingIndex");
+        let assets = document.read(cx).pending_assets_for_save();
+        let saved_assets = assets.clone();
         let (reply, response) = oneshot::channel();
         if self.engine.send(EngineCommand::SaveFinished {
             note_id: note.note_id,
             path: note.path.clone(),
+            assets,
             reply,
         }).is_err() {
             self.index_pending = Some(note);
@@ -2161,6 +2195,7 @@ impl PluginWindow {
                 }
                 match result {
                     Ok(()) => {
+                        document.update(cx, |host, _| host.complete_pending_assets(&saved_assets));
                         view.index_pending = None;
                         view.saving = false;
                         view.failure = None;
@@ -2246,9 +2281,9 @@ impl PluginWindow {
     }
 
     fn update_title(&self, window: &mut Window, cx: &App) {
-        let title = self.note.as_ref().map(|note| file_name(&note.path))
-            .unwrap_or_else(|| plugin_text(cx, "plugin.appTitle"));
-        window.set_window_title(&format!("{title} — Nomo"));
+        let app_title = plugin_text(cx, "plugin.appTitle");
+        let title = self.note.as_ref().map(|note| file_name(&note.path));
+        window.set_window_title(&plugin_window_title(title.as_deref(), &app_title));
     }
 
     fn request_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -2333,6 +2368,13 @@ fn retarget_queued_notes(
     match after_save {
         AfterSave::Open(note) | AfterSave::Delete(note) => retarget_note(note, note_id, path),
         AfterSave::None | AfterSave::Close => {}
+    }
+}
+
+fn plugin_window_title(note_name: Option<&str>, app_title: &str) -> String {
+    match note_name {
+        Some(name) => format!("{name} — {app_title}"),
+        None => app_title.to_string(),
     }
 }
 
@@ -2809,6 +2851,15 @@ mod tests {
     }
 
     #[test]
+    fn plugin_window_title_uses_the_cobrand_without_repeating_it() {
+        assert_eq!(plugin_window_title(None, PLUGIN_DISPLAY_NAME), PLUGIN_DISPLAY_NAME);
+        assert_eq!(
+            plugin_window_title(Some("note.md"), PLUGIN_DISPLAY_NAME),
+            "note.md — PinGloss-Note x Nomo"
+        );
+    }
+
+    #[test]
     fn every_plugin_translation_has_all_languages_and_matching_placeholders() {
         let source = include_str!("runtime.rs");
         let source = source.split_once("#[cfg(test)]").expect("测试段标记").0;
@@ -2825,6 +2876,7 @@ mod tests {
         };
         for locale in ["zh-CN", "zh-TW", "en-US", "ja-JP"] {
             let table = &values[locale];
+            assert_eq!(table["plugin.appTitle"], PLUGIN_DISPLAY_NAME, "{locale} 的插件联名漂了");
             for key in &keys {
                 let text = table[key].as_str().unwrap_or_else(|| panic!("{locale} 缺 {key}"));
                 assert!(!text.trim().is_empty(), "{locale} 的 {key} 是空串");
@@ -3295,7 +3347,7 @@ mod tests {
         let captured = port.capture_for_save(port.status().unwrap().revision).unwrap();
         port.save_captured(captured, None, false).unwrap();
         assert_eq!(std::fs::read_to_string(&new_path).unwrap(), body);
-        engine.finish_save(note.note_id, &new_path).unwrap();
+        engine.finish_save(note.note_id, &new_path, &[]).unwrap();
 
         let row = engine.db.note(note.note_id).unwrap().unwrap();
         assert_eq!(row.title.as_deref(), Some("正式保存标题"));
@@ -3311,6 +3363,73 @@ mod tests {
     }
 
     #[test]
+    fn save_finished_command_records_only_assets_referenced_by_the_saved_body() {
+        let data = tempfile::Builder::new().prefix("nomo-rt-assets-db").tempdir().unwrap();
+        let root = tempfile::Builder::new().prefix("nomo-rt-assets-root").tempdir().unwrap();
+        let mut engine = engine(&data.path().join("notes.db"));
+        let note = create_note(&mut engine, &root.path().to_string_lossy());
+        let root_handle = Root::open(root.path()).unwrap();
+        let row = engine.db.note(note.note_id).unwrap().unwrap();
+        let parent = row.body_path.rsplit_once('/').unwrap().0;
+        let id = "ab".repeat(16);
+        let rel_path = format!("{parent}/a/{id}.png");
+        let asset_path = root_handle.resolve(&rel_path).unwrap();
+        std::fs::create_dir_all(asset_path.parent().unwrap()).unwrap();
+        let contents = b"plugin attachment bytes";
+        std::fs::write(&asset_path, contents).unwrap();
+        let referenced = crate::plugin::storage::AssetRow {
+            id: id.clone(),
+            note_id: note.note_id,
+            kind: crate::plugin::storage::AssetKind::Image,
+            rel_path,
+            source_kind: crate::plugin::storage::SourceKind::File,
+            source_ref: String::new(),
+            bytes: contents.len() as u64,
+            width: Some(2),
+            height: Some(2),
+            frames: None,
+            duration_ms: None,
+            sha256: crate::plugin::storage::hex_lower(&Sha256::digest(contents)),
+            created_at_ms: 1,
+        };
+        let mut unreferenced = referenced.clone();
+        unreferenced.id = "cd".repeat(16);
+        unreferenced.rel_path = format!("{parent}/a/{}.png", unreferenced.id);
+        let body = format!("# 附件保存\n\n![图](a/{id}.png)\n");
+        std::fs::write(&note.path, &body).unwrap();
+        engine.pending_change = None;
+
+        let (reply, response) = oneshot::channel();
+        engine.handle_command(EngineCommand::SaveFinished {
+            note_id: note.note_id,
+            path: note.path.clone(),
+            assets: vec![referenced.clone(), unreferenced],
+            reply,
+        });
+        response.blocking_recv().unwrap().unwrap();
+
+        let check = rusqlite::Connection::open(&engine.db_path).unwrap();
+        let count: i64 = check.query_row(
+            "SELECT COUNT(*) FROM note_assets WHERE note_id=?1",
+            [note.note_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+        let saved: (String, String, u64) = check.query_row(
+            "SELECT id, rel_path, bytes FROM note_assets WHERE note_id=?1",
+            [note.note_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(saved, (referenced.id, referenced.rel_path, referenced.bytes));
+        assert_eq!(engine.db.note(note.note_id).unwrap().unwrap().title.as_deref(), Some("附件保存"));
+        assert_eq!(engine.pending_change, Some(json!({
+            "folder": 7,
+            "note_id": note.note_id,
+            "kind": "saved",
+        })));
+    }
+
+    #[test]
     fn oversized_plugin_body_is_rejected_before_save_and_index_update() {
         let data = tempfile::Builder::new().prefix("nomo-rt-limit-db").tempdir().unwrap();
         let root = tempfile::Builder::new().prefix("nomo-rt-limit-root").tempdir().unwrap();
@@ -3323,7 +3442,7 @@ mod tests {
 
         let prepare = engine.prepare_save(note.note_id, &note.path).unwrap_err();
         assert!(prepare.contains("超过可保存上限"), "{prepare}");
-        let finish = engine.finish_save(note.note_id, &note.path).unwrap_err();
+        let finish = engine.finish_save(note.note_id, &note.path, &[]).unwrap_err();
         assert!(finish.contains("超过可改上限"), "{finish}");
         assert!(engine.pending_change.is_none(), "超限正文不能更新索引或推 saved");
         let row = engine.db.note(note.note_id).unwrap().unwrap();
@@ -3355,7 +3474,7 @@ mod tests {
         };
         engine.prepare_save(note.note_id, &note.path).unwrap();
         std::fs::write(&note.path, "# 显式正文根\n").unwrap();
-        engine.finish_save(note.note_id, &note.path).unwrap();
+        engine.finish_save(note.note_id, &note.path, &[]).unwrap();
         let saved = engine.db.note(note.note_id).unwrap().unwrap();
         assert_eq!(saved.title.as_deref(), Some("显式正文根"));
     }
@@ -3615,6 +3734,7 @@ mod tests {
         command_tx.send(EngineCommand::SaveFinished {
             note_id: note.note_id,
             path: note.path.clone(),
+            assets: Vec::new(),
             reply: finish_reply,
         }).unwrap();
         finish_response.blocking_recv().unwrap().unwrap();

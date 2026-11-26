@@ -83,7 +83,8 @@ pub struct DocumentHost {
     accepts_workspace_focus: bool,
     toolbar_marks: u8,
     quick: quick_insert_host::QuickInsertUi,
-
+    plugin_attachments: Option<crate::plugin::attachments::PluginAttachmentConfig>,
+    pending_assets: Vec<crate::plugin::storage::AssetRow>,
 }
 impl DocumentHost {
     #[cfg(feature = "nomo-mark-demo")]
@@ -155,7 +156,8 @@ impl DocumentHost {
             active_pane: 0, split_ratio: 0.5, split_dragging: false, split_focus: cx.focus_handle(),
             focus_pending: false, accepts_workspace_focus:true, toolbar_marks: 0,
             quick: Default::default(),
-
+            plugin_attachments: None,
+            pending_assets: Vec::new(),
         }
     }
     fn event(&mut self, source: Entity<NomoMark>, event: &ControlEvent, cx: &mut Context<Self>) {

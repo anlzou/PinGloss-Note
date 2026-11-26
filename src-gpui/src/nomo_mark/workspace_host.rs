@@ -45,6 +45,54 @@ impl Focusable for DocumentHost {
     }
 }
 
+const MAX_PENDING_ASSETS: usize = 128;
+
+fn discard_pending_assets(
+    pending: &mut Vec<crate::plugin::storage::AssetRow>,
+    assets: &[crate::plugin::storage::AssetRow],
+) {
+    pending.retain(|pending| !assets.iter().any(|asset| asset == pending));
+}
+
+fn apply_pending_asset_batch(
+    pending: &mut Vec<crate::plugin::storage::AssetRow>,
+    note_id: Option<i64>,
+    assets: Vec<crate::plugin::storage::AssetRow>,
+    apply: impl FnOnce(&[crate::plugin::storage::AssetRow]) -> Result<(), ControlError>,
+) -> Result<(), ControlError> {
+    if assets.is_empty() {
+        return apply(pending);
+    }
+    let Some(note_id) = note_id else {
+        return Err(ControlError::Stale);
+    };
+    if assets.iter().any(|asset| asset.note_id != note_id) {
+        return Err(ControlError::HostFailure("附件归属与当前笔记不一致".into()));
+    }
+    let mut additions = Vec::new();
+    for asset in assets.clone() {
+        if let Some(existing) = pending.iter().chain(additions.iter()).find(|existing| existing.id == asset.id) {
+            if existing != &asset {
+                return Err(ControlError::HostFailure(format!("附件 {} 的待账形状不一致", asset.id)));
+            }
+            continue;
+        }
+        additions.push(asset);
+    }
+    if pending.len() + additions.len() > MAX_PENDING_ASSETS {
+        return Err(ControlError::HostFailure("待保存附件已达 128 个上限，请先保存笔记".into()));
+    }
+    let inserted = additions.clone();
+    pending.extend(additions);
+    match apply(pending) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            discard_pending_assets(pending, &inserted);
+            Err(error)
+        }
+    }
+}
+
 impl DocumentHost {
     pub(crate) fn workspace(
         port: NativeWindowPort,
@@ -96,7 +144,8 @@ impl DocumentHost {
             active_pane: 0, split_ratio: 0.5, split_dragging: false, split_focus: cx.focus_handle(),
             focus_pending: false, accepts_workspace_focus:true, toolbar_marks: 0,
             quick: Default::default(),
-
+            plugin_attachments: None,
+            pending_assets: Vec::new(),
         };
         host.panes[0].reveal_selection = host.selection(cx).head_byte != 0;
         host.reset_viewport(cx);
@@ -104,6 +153,74 @@ impl DocumentHost {
         host.schedule_toc(300, false, cx);
         host
     }
+
+    pub(crate) fn set_plugin_attachments(
+        &mut self,
+        config: crate::plugin::attachments::PluginAttachmentConfig,
+        cx: &mut Context<Self>,
+    ) {
+        self.plugin_attachments = Some(config);
+        for pane in &self.panes {
+            for view in std::iter::once(&pane.control).chain(pane.viewport.mounts.iter().map(|mount| &mount.view)) {
+                view.update(cx, |view, cx| {
+                    view.plugin_attachments = true;
+                    cx.notify();
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn refresh_plugin_attachment_path(
+        &mut self,
+        note_id: i64,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ControlError> {
+        let Some(current) = &self.plugin_attachments else { return Ok(()); };
+        if current.note_id != note_id {
+            return Err(ControlError::Stale);
+        }
+        let config = crate::plugin::attachments::PluginAttachmentConfig::for_note_path(note_id, &path)
+            .map_err(ControlError::HostFailure)?;
+        self.plugin_attachments = Some(config);
+        for pane in &self.panes {
+            for view in std::iter::once(&pane.control).chain(pane.viewport.mounts.iter().map(|mount| &mount.view)) {
+                view.update(cx, |view, cx| {
+                    view.plugin_attachments = true;
+                    cx.notify();
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn can_import_plugin_assets(&self, count: usize) -> bool {
+        self.plugin_attachments.is_some()
+            && count <= MAX_PENDING_ASSETS.saturating_sub(self.pending_assets.len())
+    }
+
+    pub(crate) fn apply_plugin_asset_edit(
+        &mut self,
+        assets: Vec<crate::plugin::storage::AssetRow>,
+        result: crate::nomo_mark::commands::EditResult,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ControlError> {
+        let note_id = self.plugin_attachments.as_ref().map(|config| config.note_id);
+        let control = self.control.clone();
+        apply_pending_asset_batch(&mut self.pending_assets, note_id, assets, |_| {
+            control.update(cx, |view, cx| view.apply_host_edit(result, cx))
+        })
+    }
+
+    pub(crate) fn pending_assets_for_save(&self) -> Vec<crate::plugin::storage::AssetRow> {
+        self.pending_assets.clone()
+    }
+
+    pub(crate) fn complete_pending_assets(&mut self, assets: &[crate::plugin::storage::AssetRow]) {
+        discard_pending_assets(&mut self.pending_assets, assets);
+    }
+
     /// 目标窗口只接管一个已加载的片段。正文、历史和修订继续由同一个原生会话持有。
     pub(crate) fn transfer_adapter(&self, byte:u64, cx:&App) -> Result<WindowHostAdapter,ControlError> {
         self.ready(cx)?;
@@ -628,5 +745,90 @@ impl Render for DocumentHost {
         div().size_full().min_w_0().relative().flex().flex_col().bg(Theme::ui(cx).surface)
             .children(animate_theme.then(crate::ui::motion::theme_frame))
             .children(error_bar).child(self.render_panes(window,cx)).children(overlay).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::storage::{AssetKind, AssetRow, SourceKind};
+
+    fn asset(id: &str, note_id: i64) -> AssetRow {
+        AssetRow {
+            id: id.into(),
+            note_id,
+            kind: AssetKind::Image,
+            rel_path: format!("folders/inbox/notes/a/{id}.png"),
+            source_kind: SourceKind::File,
+            source_ref: String::new(),
+            bytes: 1,
+            width: None,
+            height: None,
+            frames: None,
+            duration_ms: None,
+            sha256: "0".repeat(64),
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn asset_batch_is_pending_before_edit_and_rolls_back_only_its_insertions() {
+        let existing = asset(&"a".repeat(32), 7);
+        let inserted = asset(&"b".repeat(32), 7);
+        let mut pending = vec![existing.clone()];
+        let result = apply_pending_asset_batch(
+            &mut pending,
+            Some(7),
+            vec![existing.clone(), inserted.clone()],
+            |visible| {
+                assert_eq!(visible, &[existing.clone(), inserted.clone()]);
+                Err(ControlError::Stale)
+            },
+        );
+        assert!(matches!(result, Err(ControlError::Stale)));
+        assert_eq!(pending, vec![existing]);
+    }
+
+    #[test]
+    fn rejected_asset_batch_never_runs_the_edit() {
+        let existing = asset(&"c".repeat(32), 7);
+        let foreign = asset(&"d".repeat(32), 8);
+        let mut pending = vec![existing.clone()];
+        let mut called = false;
+        let result = apply_pending_asset_batch(&mut pending, Some(7), vec![foreign], |_| {
+            called = true;
+            Ok(())
+        });
+        assert!(matches!(result, Err(ControlError::HostFailure(_))));
+        assert!(!called);
+        assert_eq!(pending, vec![existing]);
+    }
+
+    #[test]
+    fn full_asset_queue_rejects_the_batch_before_editing() {
+        let mut pending = (0..MAX_PENDING_ASSETS)
+            .map(|index| asset(&format!("{index:032x}"), 7))
+            .collect::<Vec<_>>();
+        let extra = asset(&"f".repeat(32), 7);
+        let mut called = false;
+        let result = apply_pending_asset_batch(&mut pending, Some(7), vec![extra], |_| {
+            called = true;
+            Ok(())
+        });
+        assert!(matches!(result, Err(ControlError::HostFailure(_))));
+        assert!(!called);
+        assert_eq!(pending.len(), MAX_PENDING_ASSETS);
+    }
+
+    #[test]
+    fn successful_asset_edit_keeps_the_batch_pending() {
+        let inserted = asset(&"e".repeat(32), 7);
+        let mut pending = Vec::new();
+        apply_pending_asset_batch(&mut pending, Some(7), vec![inserted.clone()], |visible| {
+            assert_eq!(visible, &[inserted.clone()]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(pending, vec![inserted]);
     }
 }

@@ -84,6 +84,7 @@ pub struct NomoMark {
     pub mode: ViewMode,
     pub base_dir: Option<PathBuf>,
     pub(crate) workspace_hosted: bool,
+    pub(crate) plugin_attachments: bool,
     pub(crate) windowed_navigation: bool,
     pub(crate) open_profile: Option<crate::open_profile::OpenProfile>,
     focus: FocusHandle,
@@ -191,6 +192,7 @@ impl NomoMark {
             pending_navigation_caret: false,
             pending_block_navigation: None,
             workspace_hosted: false,
+            plugin_attachments: false,
             windowed_navigation: false,
             open_profile: None,
             last_geometry: None,
@@ -957,15 +959,28 @@ impl NomoMark {
         }
         let text = cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default();
         let at = self.local_cursor();
-        // P2：非纯文本粘贴时，剪贴板若是一行本地图片路径或 `file://`，转成 `![alt](path)`。
-        // 代码上下文与表格单元格保持原文本、不转换（与现有侧车口径一致）。
+        // 本地图片路径在普通文档保留绝对路径；插件笔记改走附件复制与保存后记账。
+        // 代码上下文与表格单元格保持原文本、不转换。
         if !plain && !self.auxiliary_input {
-            if let Some(markdown) = super::image_paste::pasted_image_markdown(&text) {
+            let local_path = super::image_paste::pasted_image_path(&text);
+            let markdown = (!self.plugin_attachments)
+                .then(|| super::image_paste::pasted_image_markdown(&text))
+                .flatten();
+            if local_path.is_some() || markdown.is_some() {
                 let in_literal = self.host.parsed.nodes.iter().any(|n| n.kind == "code" && n.source.contains(&at))
                     || self.host.parsed.inline.iter().any(|s| s.format == InlineFormat::Code && s.content.start <= at && at <= s.content.end);
                 let in_cell = super::table_inline::html_cell(&self.host.parsed, &(at..at)).is_some();
                 if !in_literal && !in_cell {
-                    self.command(EditIntent::Replace(markdown), cx);
+                    if self.plugin_attachments {
+                        if let Err(error) = self.prepare_unmount() { self.error(error, cx); return; }
+                        cx.emit(ControlEvent::InsertImages {
+                            identity: self.host.parsed.identity.clone(),
+                            selection: self.host.selection,
+                            inputs: vec![crate::image_import::ImageInput::File(local_path.unwrap())],
+                        });
+                    } else if let Some(markdown) = markdown {
+                        self.command(EditIntent::Replace(markdown), cx);
+                    }
                     return;
                 }
             }

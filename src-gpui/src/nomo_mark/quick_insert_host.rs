@@ -14,7 +14,14 @@ enum Picker {
 }
 impl Picker {fn target(&self)->&QuickTarget {match self {Self::Link{target,..}|Self::Emoji{target,..}=>target}}}
 #[derive(Clone)]
-struct ImportRequest {id:u64,target:QuickTarget,cancel:ImportCancellation,settings:ImageSettings,path:Option<PathBuf>}
+struct ImportRequest {id:u64,target:QuickTarget,cancel:ImportCancellation,settings:ImageSettings,path:Option<PathBuf>,attachments:Option<crate::plugin::attachments::PluginAttachmentConfig>}
+struct QuickImageBatch {images:Vec<crate::image_import::ImportedImage>,assets:Vec<crate::plugin::storage::AssetRow>,failed:usize,errors:Vec<String>}
+impl From<image_import::ImportBatch> for QuickImageBatch {
+    fn from(batch:image_import::ImportBatch)->Self {Self {images:batch.images,assets:Vec::new(),failed:batch.failed,errors:batch.errors}}
+}
+impl From<crate::plugin::attachments::PluginImportBatch> for QuickImageBatch {
+    fn from(batch:crate::plugin::attachments::PluginImportBatch)->Self {Self {images:batch.images,assets:batch.assets,failed:batch.failed,errors:batch.errors}}
+}
 #[derive(Default)]
 pub(super) struct QuickInsertUi {
     pub action:Option<A>,
@@ -199,16 +206,16 @@ impl DocumentHost {
         static NEXT: AtomicU64 = AtomicU64::new(1 << 32);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         self.quick.cancel();
-        self.quick.import = Some(ImportRequest { id, target, cancel: Default::default(), settings, path: self.path() });
+        self.quick.import = Some(ImportRequest { id, target, cancel: Default::default(), settings, path: self.path(), attachments: self.plugin_attachments.clone() });
         self.dismiss_quick(cx);
         self.quick_image_paths(id, inputs, window, cx);
     }
     fn choose_quick_images(&mut self,target:QuickTarget,window:&mut Window,cx:&mut Context<Self>) {
         let settings=ImageSettings::read(&cx.global::<crate::settings::Settings>().value("imageHandlingSettings"));
-        if !matches!(settings.strategy.as_str(),"copy-current-folder"|"copy-assets"|"copy-document-assets"|"upload") {self.quick_error(ControlError::Unsupported("图片处理方式无效".into()),cx);return;}
+        if self.plugin_attachments.is_none() && !matches!(settings.strategy.as_str(),"copy-current-folder"|"copy-assets"|"copy-document-assets"|"upload") {self.quick_error(ControlError::Unsupported("图片处理方式无效".into()),cx);return;}
         static NEXT:AtomicU64=AtomicU64::new(1);
         let id=NEXT.fetch_add(1,Ordering::Relaxed);
-        self.quick.cancel();self.quick.import=Some(ImportRequest{id,target,cancel:Default::default(),settings,path:self.path()});self.dismiss_quick(cx);
+        self.quick.cancel();self.quick.import=Some(ImportRequest{id,target,cancel:Default::default(),settings,path:self.path(),attachments:self.plugin_attachments.clone()});self.dismiss_quick(cx);
         let response=cx.prompt_for_paths(gpui::PathPromptOptions{files:true,directories:false,multiple:true,prompt:Some(ToolbarLocale::current(cx).text("quick_choose_images").into())});
         cx.spawn_in(window,async move|this,cx|{
             let paths=response.await;
@@ -222,6 +229,16 @@ impl DocumentHost {
     fn quick_image_paths(&mut self,id:u64,paths:Vec<ImageInput>,window:&mut Window,cx:&mut Context<Self>) {
         let Some(request)=self.quick.import.as_ref().filter(|r|r.id==id)else{return;};
         if !self.import_current(request,cx){self.quick.cancel();cx.notify();return;}
+        if request.attachments.is_some() {
+            if !self.can_import_plugin_assets(paths.len()) {
+                self.quick.cancel();
+                self.report(ControlError::HostFailure("待保存附件已达 128 个上限，请先保存笔记".into()), cx);
+                cx.notify();
+                return;
+            }
+            self.start_quick_image_import(id,paths,window,cx);
+            return;
+        }
         if self.path().is_some() || request.settings.strategy == "upload" {self.start_quick_image_import(id,paths,window,cx);return;}
         let response=match self.prompt_save_path(window,cx) {
             Ok(response)=>response,
@@ -279,7 +296,14 @@ impl DocumentHost {
         request.path=path.clone();self.quick.import=Some(request.clone());
         let path=path.unwrap_or_default();
         let worker=request.clone();
-        let task=cx.background_executor().spawn(async move{image_import::import_inputs(paths,&path,&worker.settings,&worker.cancel)});
+        let attachments=request.attachments.clone();
+        let task=cx.background_executor().spawn(async move {
+            if let Some(config)=attachments {
+                crate::plugin::attachments::import_inputs(&config,paths,&worker.cancel).map(QuickImageBatch::from)
+            } else {
+                image_import::import_inputs(paths,&path,&worker.settings,&worker.cancel).map(QuickImageBatch::from)
+            }
+        });
         cx.spawn_in(window,async move|this,cx|{
             let result=task.await;
             let _=this.update_in(cx,|host,window,cx|{
@@ -288,14 +312,15 @@ impl DocumentHost {
                     if owns_request { host.quick.cancel(); }
                     let count = request.cancel.created_resources();
                     if count > 0 && !host.closed {
-                        let action = if request.settings.strategy == "upload" { "上传" } else { "复制" };
+                        let action = if request.attachments.is_none() && request.settings.strategy == "upload" { "上传" } else { "复制" };
                         cx.emit(DocumentEvent::Notice(format!("已{action} {count} 张图片，但插入位置已失效，文档未插入图片。")));
                     }
                     cx.notify();
                     return;
                 }
                 let result=result.map_err(ControlError::HostFailure).and_then(|batch|{
-                    if batch.images.is_empty(){return Err(ControlError::HostFailure(format!("图片导入失败（{} 张）：{}",batch.failed,batch.errors.join("；"))));}
+                    let QuickImageBatch { images, assets, failed, errors } = batch;
+                    if images.is_empty(){return Err(ControlError::HostFailure(format!("图片导入失败（{} 张）：{}",failed,errors.join("；"))));}
                     let view=host.control.read(cx);let parsed=&view.host.parsed;let range=request.target.range.clone();let base=parsed.identity.from_byte;
                     let eol=crate::nomo_mark::commands::line_ending(&parsed.source,range.start);
                     let line_start=crate::nomo_mark::commands::line_start(&parsed.source,range.start);
@@ -303,23 +328,23 @@ impl DocumentHost {
                     let inline=!parsed.source[line_start..range.start].trim().is_empty() || !line_after.trim().is_empty()
                         || parsed.nodes.iter().any(|node|matches!(node.kind,"heading"|"cell")&&node.source.contains(&range.start));
                     let markdown=inline || (request.settings.width.is_empty() && request.settings.align=="none");
-                    let snippets=batch.images.iter().map(|image|ImageProperties{src:image.src.clone(),alt:image.alt.clone(),title:String::new(),width:request.settings.width.clone(),align:if request.settings.align=="none"{String::new()}else{request.settings.align.clone()}}.write("",markdown,eol)).collect::<Result<Vec<_>,_>>()?;
+                    let snippets=images.iter().map(|image|ImageProperties{src:image.src.clone(),alt:image.alt.clone(),title:String::new(),width:request.settings.width.clone(),align:if request.settings.align=="none"{String::new()}else{request.settings.align.clone()}}.write("",markdown,eol)).collect::<Result<Vec<_>,_>>()?;
                     let text=snippets.join(if inline{" "}else{eol});
                     let selection=DocumentSelection{anchor_byte:base+range.start as u64,head_byte:base+range.end as u64};
                     let mut result=if request.target.edit.is_semantic() { crate::nomo_mark::commands::apply_semantic(parsed,selection,EditIntent::Replace(text))? }
                         else { crate::nomo_mark::commands::apply(parsed,selection,EditIntent::Replace(text))? };
                     if !inline && request.target.edit.is_semantic() {quick_insert::continue_after_block(parsed,&mut result)?;}
-                    host.control.update(cx,|view,cx|view.apply_host_edit(result,cx))?;
-                    if batch.failed > 0 {
-                        let details = if batch.errors.is_empty() {
+                    host.apply_plugin_asset_edit(assets, result, cx)?;
+                    if failed > 0 {
+                        let details = if errors.is_empty() {
                             String::new()
                         } else {
-                            format!("：{}", batch.errors.join("；"))
+                            format!("：{}", errors.join("；"))
                         };
                         let message = format!(
                             "已插入 {} 张图片，{} 张失败{}",
-                            batch.images.len(),
-                            batch.failed,
+                            images.len(),
+                            failed,
                             details,
                         );
                         host.message = message.clone();

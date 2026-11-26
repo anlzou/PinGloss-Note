@@ -3876,6 +3876,7 @@ dependencies = [
  "base64 0.22.1",
  "embed-resource",
  "encoding_rs",
+ "getrandom 0.3.4",
  "gif",
  "gif-dispose",
  "gpui-pre",

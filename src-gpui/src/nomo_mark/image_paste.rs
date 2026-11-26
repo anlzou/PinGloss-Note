@@ -69,14 +69,19 @@ fn markdown_image_alt(path: &Path) -> String {
         .collect()
 }
 
-/// 若剪贴板文本是一行指向已存在本地图片的路径或 `file://`，生成 `![alt](path)`；
-/// 否则返回 `None`（按原文本插入）。不复制文件、不下载远程图：本地路径保留原绝对路径。
-pub(crate) fn pasted_image_markdown(text: &str) -> Option<String> {
+/// 单行本地图片路径或 `file://` 的原路径；远程 URL 与多行文本不转换。
+pub(crate) fn pasted_image_path(text: &str) -> Option<PathBuf> {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
         return None;
     }
-    let path = local_image_path(trimmed)?;
+    local_image_path(trimmed)
+}
+
+/// 若剪贴板文本是一行指向已存在本地图片的路径或 `file://`，生成 `![alt](path)`；
+/// 否则返回 `None`（按原文本插入）。不复制文件、不下载远程图：本地路径保留原绝对路径。
+pub(crate) fn pasted_image_markdown(text: &str) -> Option<String> {
+    let path = pasted_image_path(text)?;
     let path_text = markdown_path_string(&path);
     Some(format!(
         "![{}]({})",
@@ -151,12 +156,8 @@ mod tests {
 
     #[test]
     fn escapes_parenthesis_space_and_quote_in_target() {
-        let dir = std::env::temp_dir().join(format!("nomo-p2e-{}", std::process::id()));
-        let tricky = dir.join("a (1) \"x\".png");
-        fs::create_dir_all(&dir).unwrap();
-        let path = temp_image(&dir, "a (1) \"x\".png");
-        let markdown = pasted_image_markdown(&path.to_string_lossy()).unwrap();
-        assert!(markdown.contains("\\(") && markdown.contains("\\)") && markdown.contains("\\\""), "{markdown}");
-        fs::remove_dir_all(&dir).ok();
+        let target = "images/a (1) \"x\".png";
+        let escaped = markdown_image_target(target);
+        assert_eq!(escaped, "images/a \\(1\\) \\\"x\\\".png");
     }
 }

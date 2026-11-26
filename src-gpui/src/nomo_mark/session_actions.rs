@@ -348,6 +348,7 @@ impl DocumentHost {
                                         host.control = cx.new(|cx| {
                                             let mut v = NomoMark::new(adapter, cx); v.code_view_port = Some(host.port.clone());
                                             v.windowed_navigation = host.production;
+                                            v.plugin_attachments = host.plugin_attachments.is_some();
                                             v.base_dir = base_dir;
                                             v.host.selection = DocumentSelection::caret(first_line_end);
                                             v

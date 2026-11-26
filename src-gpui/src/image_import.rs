@@ -41,11 +41,18 @@ impl ImportCancellation {
     pub fn cancel(&self){self.0.cancelled.store(true,Ordering::Release);}
     pub fn cancelled(&self)->bool{self.0.cancelled.load(Ordering::Acquire)}
     pub fn created_resources(&self)->usize{self.0.created.load(Ordering::Acquire)}
-    fn record_resource(&self){self.0.created.fetch_add(1,Ordering::Release);}
-    fn check(&self)->Result<(),String>{if self.cancelled(){Err("图片导入已取消".into())}else{Ok(())}}
+    pub(crate) fn record_resource(&self){self.0.created.fetch_add(1,Ordering::Release);}
+    pub(crate) fn check(&self)->Result<(),String>{if self.cancelled(){Err("图片导入已取消".into())}else{Ok(())}}
 }
+#[derive(Debug)]
 pub(crate) struct ImportedImage {pub src:String,pub alt:String}
 pub(crate) struct ImportBatch {pub images:Vec<ImportedImage>,pub failed:usize,pub errors:Vec<String>}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageInfo {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
 
 /// 剪贴板字节只在一次导入期间共享，不放入文档状态或常驻缓存。
 #[derive(Clone, Debug, PartialEq)]
@@ -129,7 +136,7 @@ fn markdown_src(prefix:&str,name:&str)->String {
     format!("{prefix}{}",encode(name))
 }
 
-fn fingerprint(path:&Path,cancel:&ImportCancellation)->Result<[u8;32],String> {
+pub(crate) fn fingerprint(path:&Path,cancel:&ImportCancellation)->Result<[u8;32],String> {
     let mut file=File::open(path).map_err(|e|e.to_string())?;
     let mut hash=Sha256::new();let mut buffer=[0u8;64*1024];let mut bytes=0u64;
     loop {cancel.check()?;let count=file.read(&mut buffer).map_err(|e|e.to_string())?;if count==0{break;}
@@ -145,7 +152,7 @@ fn safe_segment(value:&str)->String {
 struct IncompleteCopy {path:PathBuf,complete:bool}
 impl Drop for IncompleteCopy {fn drop(&mut self){if !self.complete{let _=fs::remove_file(&self.path);}}}
 
-fn validate_image(path: &Path) -> Result<(), String> {
+pub(crate) fn inspect_image(path: &Path) -> Result<ImageInfo, String> {
     if !supported(path){return Err("仅支持 PNG、JPEG、GIF、WebP、BMP 和 SVG 图片".into());}
     let metadata=fs::metadata(path).map_err(|e|format!("无法读取图片：{e}"))?;
     if !metadata.is_file() || metadata.len()==0 || metadata.len()>crate::images::MAX_INPUT_BYTES{return Err("图片为空或超过 32 MiB 输入预算".into());}
@@ -154,7 +161,8 @@ fn validate_image(path: &Path) -> Result<(), String> {
         let mut encoded = Vec::new();
         fs::File::open(path).map_err(|e| e.to_string())?.take(crate::images::MAX_SVG_BYTES as u64 + 1)
             .read_to_end(&mut encoded).map_err(|e| e.to_string())?;
-        return crate::images::validate_svg(&encoded);
+        crate::images::validate_svg(&encoded)?;
+        return Ok(ImageInfo { width: None, height: None });
     }
     let mut reader=image::ImageReader::open(path).map_err(|e|e.to_string())?.with_guessed_format().map_err(|e|e.to_string())?;
     let mut limits=image::Limits::default();limits.max_alloc=Some(crate::images::MAX_DECODE_BYTES);limits.max_image_width=Some(32768);limits.max_image_height=Some(32768);reader.limits(limits);
@@ -163,7 +171,11 @@ fn validate_image(path: &Path) -> Result<(), String> {
     let (width,height)=decoder.dimensions();
     if width==0 || height==0 || width>32768 || height>32768 || u64::from(width)*u64::from(height)>crate::images::MAX_INPUT_PIXELS || decoder.total_bytes()>crate::images::MAX_DECODE_BYTES {return Err("图片超过现有尺寸或解码资源预算".into());}
     drop(decoder);
-    Ok(())
+    Ok(ImageInfo { width: Some(width), height: Some(height) })
+}
+
+fn validate_image(path: &Path) -> Result<(), String> {
+    inspect_image(path).map(|_| ())
 }
 
 fn import_one(path:&Path,directory:&Path,prefix:&str,cancel:&ImportCancellation)->Result<ImportedImage,String> {

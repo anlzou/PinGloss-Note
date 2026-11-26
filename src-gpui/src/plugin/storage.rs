@@ -143,6 +143,55 @@ pub struct NoteRow {
     pub bytes: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssetKind {
+    Image,
+    Gif,
+}
+
+impl AssetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Gif => "gif",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    Pin,
+    Gif,
+    File,
+}
+
+impl SourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pin => "pin",
+            Self::Gif => "gif",
+            Self::File => "file",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetRow {
+    pub id: String,
+    pub note_id: i64,
+    pub kind: AssetKind,
+    pub rel_path: String,
+    pub source_kind: SourceKind,
+    pub source_ref: String,
+    pub bytes: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub frames: Option<u32>,
+    pub duration_ms: Option<u32>,
+    pub sha256: String,
+    pub created_at_ms: i64,
+}
+
 /// 墙钟毫秒。宿主写侧也用这个量纲（`notes_io.rs::now_ms`）。
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -283,44 +332,32 @@ impl Db {
     ///
     /// ⚠ 存进 `title` 列的是**从正文派生出来的**标题（sidecar `after_save` 那一格），非空才写、否则 `NULL`。
     pub fn save_note(&self, row: &mut NoteRow, body: &str) -> Res<()> {
-        if body.len() > MAX_DOC_BYTES {
-            return Err(format!(
-                "正文 {} B 超过可改上限 {MAX_DOC_BYTES} B",
-                body.len()
-            ));
+        save_note_on(&self.conn, row, body)
+    }
+
+    /// 正文与仍被引用的附件同事务落账；未引用的副本不阻止正文保存。
+    pub fn save_note_with_assets(
+        &mut self,
+        row: &mut NoteRow,
+        body: &str,
+        root: &Root,
+        assets: &[AssetRow],
+    ) -> Res<()> {
+        let tx = self.conn.transaction().es()?;
+        save_note_on(&tx, row, body)?;
+        let mut seen = std::collections::BTreeMap::new();
+        for asset in assets.iter().filter(|asset| {
+            asset.note_id == row.id && body_references_asset(body, asset)
+        }) {
+            if let Some(previous) = seen.insert(asset.id.as_str(), asset) {
+                if previous != asset {
+                    return Err(format!("附件 {} 在同一批待办里形状不一致", asset.id));
+                }
+            }
+            validate_asset_file(root, row, asset)?;
+            put_asset_on(&tx, asset)?;
         }
-        let bytes = body.len() as i64;
-        let derived = derive_title(body);
-        row.title = if derived.trim().is_empty() {
-            None
-        } else {
-            Some(derived)
-        };
-        row.updated_at_ms = now_ms();
-        row.bytes = bytes;
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE notes SET title=?1, body_path=?2, bytes=?3, updated_at_ms=?4 \
-                 WHERE id=?5 AND kind=?6 AND folder_id=?7 AND enc=?8",
-                params![
-                    row.title,
-                    row.body_path,
-                    bytes,
-                    row.updated_at_ms,
-                    row.id,
-                    row.kind.as_str(),
-                    row.folder_id,
-                    row.enc.bit()
-                ],
-            )
-            .es()?;
-        if changed == 0 {
-            return Err(format!(
-                "第 {} 号那一行已被别处改动（身份列对不上），这次保存作废",
-                row.id
-            ));
-        }
+        tx.commit().es()?;
         Ok(())
     }
 
@@ -493,6 +530,243 @@ impl Db {
     }
 }
 
+fn save_note_on(conn: &Connection, row: &mut NoteRow, body: &str) -> Res<()> {
+    if body.len() > MAX_DOC_BYTES {
+        return Err(format!(
+            "正文 {} B 超过可改上限 {MAX_DOC_BYTES} B",
+            body.len()
+        ));
+    }
+    let bytes = body.len() as i64;
+    let derived = derive_title(body);
+    row.title = if derived.trim().is_empty() {
+        None
+    } else {
+        Some(derived)
+    };
+    row.updated_at_ms = now_ms();
+    row.bytes = bytes;
+    let changed = conn
+        .execute(
+            "UPDATE notes SET title=?1, body_path=?2, bytes=?3, updated_at_ms=?4 \
+             WHERE id=?5 AND kind=?6 AND folder_id=?7 AND enc=?8",
+            params![
+                row.title,
+                row.body_path,
+                bytes,
+                row.updated_at_ms,
+                row.id,
+                row.kind.as_str(),
+                row.folder_id,
+                row.enc.bit()
+            ],
+        )
+        .es()?;
+    if changed == 0 {
+        return Err(format!(
+            "第 {} 号那一行已被别处改动（身份列对不上），这次保存作废",
+            row.id
+        ));
+    }
+    Ok(())
+}
+
+fn put_asset_on(conn: &Connection, asset: &AssetRow) -> Res<()> {
+    let existing: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT note_id, rel_path FROM note_assets WHERE id=?1",
+            params![asset.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .es()?;
+    if let Some((note_id, rel_path)) = existing {
+        if note_id != asset.note_id || rel_path != asset.rel_path {
+            return Err(format!(
+                "附件 {} 已属于另一篇笔记或另一路径，拒绝覆盖",
+                asset.id
+            ));
+        }
+        let changed = conn
+            .execute(
+                "UPDATE note_assets SET kind=?1, source_kind=?2, source_ref=?3, bytes=?4, \
+                 width=?5, height=?6, frames=?7, duration_ms=?8, sha256=?9, created_at_ms=?10 \
+                 WHERE id=?11 AND note_id=?12 AND rel_path=?13",
+                params![
+                    asset.kind.as_str(),
+                    asset.source_kind.as_str(),
+                    asset.source_ref,
+                    asset.bytes as i64,
+                    asset.width,
+                    asset.height,
+                    asset.frames,
+                    asset.duration_ms,
+                    asset.sha256,
+                    asset.created_at_ms,
+                    asset.id,
+                    asset.note_id,
+                    asset.rel_path
+                ],
+            )
+            .es()?;
+        if changed != 1 {
+            return Err(format!("附件 {} 重试时身份对不上", asset.id));
+        }
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO note_assets \
+         (id, note_id, kind, rel_path, source_kind, source_ref, bytes, width, height, frames, duration_ms, sha256, created_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            asset.id,
+            asset.note_id,
+            asset.kind.as_str(),
+            asset.rel_path,
+            asset.source_kind.as_str(),
+            asset.source_ref,
+            asset.bytes as i64,
+            asset.width,
+            asset.height,
+            asset.frames,
+            asset.duration_ms,
+            asset.sha256,
+            asset.created_at_ms
+        ],
+    )
+    .es()?;
+    Ok(())
+}
+
+fn is_lower_hex(value: &str, bytes: usize) -> bool {
+    value.len() == bytes * 2
+        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_asset_file(root: &Root, note: &NoteRow, asset: &AssetRow) -> Res<()> {
+    if asset.note_id <= 0 || asset.note_id != note.id {
+        return Err("附件归属的笔记身份不合规".to_string());
+    }
+    if !is_lower_hex(&asset.id, 16) {
+        return Err(format!("附件 id `{}` 不是 32 位小写 hex", asset.id));
+    }
+    if !is_lower_hex(&asset.sha256, 32) {
+        return Err(format!("附件 {} 的 sha256 不是 64 位小写 hex", asset.id));
+    }
+    if asset.source_kind != SourceKind::File || !asset.source_ref.is_empty() {
+        return Err(format!("附件 {} 不是本地文件来源", asset.id));
+    }
+    if asset.kind == AssetKind::Image && (asset.frames.is_some() || asset.duration_ms.is_some()) {
+        return Err(format!("静态图片 {} 不能带 GIF 帧度量", asset.id));
+    }
+    if asset.bytes == 0 || asset.bytes > i64::MAX as u64 || asset.created_at_ms < 0 {
+        return Err(format!("附件 {} 的大小或创建时间不合规", asset.id));
+    }
+    let (parent, file_name) = note.body_path
+        .rsplit_once('/')
+        .ok_or_else(|| "正文相对路径没有父目录".to_string())?;
+    let extension = Path::new(&asset.rel_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("附件 {} 缺少扩展名", asset.id))?;
+    if extension.is_empty()
+        || extension.len() > 8
+        || !extension.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return Err(format!("附件 {} 的扩展名不合规", asset.id));
+    }
+    let expected_name = format!("{}.{}", asset.id, extension);
+    if file_name.is_empty() || asset.rel_path != format!("{parent}/a/{expected_name}") {
+        return Err(format!("附件 {} 的落点不是当前正文旁的 a/", asset.id));
+    }
+    let path = root.resolve(&asset.rel_path)?;
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|error| format!("附件 {} 无法确认：{error}", asset.id))?;
+    let expected_dir = root.resolve(&format!("{parent}/a"))?;
+    let expected_dir = std::fs::canonicalize(&expected_dir)
+        .map_err(|error| format!("附件目录无法确认：{error}"))?;
+    if canonical.parent() != Some(expected_dir.as_path()) || !canonical.starts_with(root.path()) {
+        return Err(format!("附件 {} 落在当前正文附件目录之外", asset.id));
+    }
+    let metadata = std::fs::metadata(&canonical)
+        .map_err(|error| format!("读取附件 {} 失败：{error}", asset.id))?;
+    if !metadata.is_file() || metadata.len() != asset.bytes {
+        return Err(format!("附件 {} 的字节数与登记值对不上", asset.id));
+    }
+    let digest = crate::image_import::fingerprint(&canonical, &Default::default())?;
+    if hex_lower(&digest) != asset.sha256 {
+        return Err(format!("附件 {} 的 SHA-256 与登记值对不上", asset.id));
+    }
+    Ok(())
+}
+
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 15) as usize] as char);
+    }
+    out
+}
+
+fn asset_target_matches(target: &str, asset: &AssetRow) -> bool {
+    let target = html_escape::decode_html_entities(target.trim());
+    let target = target.strip_prefix('<').and_then(|value| value.strip_suffix('>')).unwrap_or(&target);
+    let target = target.split(['?', '#']).next().unwrap_or("");
+    let mut target = target;
+    while let Some(rest) = target.strip_prefix("./") {
+        target = rest;
+    }
+    let extension = Path::new(&asset.rel_path).extension().and_then(|value| value.to_str()).unwrap_or_default();
+    !target.contains('\\') && target == format!("a/{}.{}", asset.id, extension)
+}
+
+/// 只认解析出来的图片目标，避免正文别处的裸 asset id 或相似路径误触发落账。
+pub fn body_references_asset(body: &str, asset: &AssetRow) -> bool {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let mut events = Parser::new(body).into_offset_iter();
+    while let Some((event, range)) = events.next() {
+        match event {
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                if asset_target_matches(&dest_url, asset) {
+                    return true;
+                }
+                while let Some((event, _)) = events.next() {
+                    if matches!(event, Event::End(TagEnd::Image)) {
+                        break;
+                    }
+                }
+            }
+            Event::Html(raw) | Event::InlineHtml(raw) => {
+                let mut offset = 0;
+                let bytes = raw.as_bytes();
+                while let Some(found) = bytes[offset..]
+                    .windows(4)
+                    .position(|value| value.eq_ignore_ascii_case(b"<img"))
+                {
+                    let start = offset + found;
+                    let Some(tag) = crate::nomo_mark::nomo_syntax::html_tag(&raw, start) else {
+                        offset = start + 4;
+                        continue;
+                    };
+                    if tag.name == "img" && !tag.closing {
+                        if let Some(src) = tag.attrs.get("src") {
+                            if asset_target_matches(src, asset) {
+                                return true;
+                            }
+                        }
+                    }
+                    offset = tag.end.max(start + 4);
+                }
+            }
+            _ => {}
+        }
+        let _ = range;
+    }
+    false
+}
+
 fn read_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRow> {
     let kind_word: String = r.get(1)?;
     let enc_bit: i64 = r.get(4)?;
@@ -551,6 +825,7 @@ fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
 ///
 /// `resolve` 是**沙箱闸**：先过词法 [`check_rel`]（`..`／`.`／空段／`\`／`:`／控制字符／绝对／NUL 全拒），
 /// 再把路径限在 root 内。半路（还没建的正文）取最近存在的祖先规范化后比对，防止靠 symlink 越狱。
+#[derive(Clone, Debug)]
 pub struct Root {
     root: PathBuf,
 }
@@ -622,6 +897,9 @@ pub fn check_rel(rel: &str) -> Res<()> {
     }
     if rel.contains('\\') {
         return Err(format!("正文路径要用 `/`，不许有 `\\`：`{rel}`"));
+    }
+    if rel.chars().any(char::is_control) {
+        return Err(format!("正文路径含控制字符：`{rel}`"));
     }
     for seg in rel.split('/') {
         if seg.is_empty() || seg == "." || seg == ".." || seg.contains(':') {
@@ -1099,5 +1377,163 @@ mod tests {
         assert_eq!(got[0].title.as_deref(), Some("活的"));
         assert!(!got[0].locked);
         assert!(!got[1].exists, "库里没这一号要如实说 exists=false");
+    }
+
+    fn asset_file(root: &Root, note: &NoteRow, id: &str, contents: &[u8]) -> AssetRow {
+        use sha2::{Digest, Sha256};
+        let parent = note.body_path.rsplit_once('/').unwrap().0;
+        let rel_path = format!("{parent}/a/{id}.png");
+        let path = root.resolve(&rel_path).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+        AssetRow {
+            id: id.into(),
+            note_id: note.id,
+            kind: AssetKind::Image,
+            rel_path,
+            source_kind: SourceKind::File,
+            source_ref: String::new(),
+            bytes: contents.len() as u64,
+            width: None,
+            height: None,
+            frames: None,
+            duration_ms: None,
+            sha256: hex_lower(&Sha256::digest(contents)),
+            created_at_ms: 1,
+        }
+    }
+
+    fn asset_count(db: &Db, note_id: i64) -> i64 {
+        db.conn.query_row(
+            "SELECT COUNT(*) FROM note_assets WHERE note_id=?1",
+            [note_id],
+            |row| row.get(0),
+        ).unwrap()
+    }
+
+    #[test]
+    fn save_records_only_assets_referenced_by_real_image_targets() {
+        let d = temp_dir("asset-references");
+        let mut db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let mut row = db.create_note(&root, "inbox", 7).unwrap();
+        let referenced = asset_file(&root, &row, &"a1".repeat(16), b"referenced");
+        let bare = asset_file(&root, &row, &"b2".repeat(16), b"bare");
+        let lookalike = asset_file(&root, &row, &"c3".repeat(16), b"lookalike");
+        std::fs::remove_file(root.resolve(&bare.rel_path).unwrap()).unwrap();
+        std::fs::remove_file(root.resolve(&lookalike.rel_path).unwrap()).unwrap();
+        let body = format!(
+            "# 保存\n\n![图](a/{}.png)\n\n{} 和 ![像](ba/a/{}.png)",
+            referenced.id, bare.id, lookalike.id,
+        );
+
+        db.save_note_with_assets(&mut row, &body, &root, &[referenced.clone(), bare, lookalike]).unwrap();
+        assert_eq!(asset_count(&db, row.id), 1);
+        let saved: String = db.conn.query_row(
+            "SELECT id FROM note_assets WHERE note_id=?1",
+            [row.id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(saved, referenced.id);
+        assert_eq!(db.note(row.id).unwrap().unwrap().title.as_deref(), Some("保存"));
+    }
+
+    #[test]
+    fn asset_validation_failure_rolls_back_the_note_update() {
+        let d = temp_dir("asset-rollback");
+        let mut db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let mut row = db.create_note(&root, "inbox", 7).unwrap();
+        let old_body = "# 旧标题";
+        db.save_note(&mut row, old_body).unwrap();
+        let asset = asset_file(&root, &row, &"d4".repeat(16), b"original");
+        std::fs::write(root.resolve(&asset.rel_path).unwrap(), b"changed").unwrap();
+        let body = format!("# 新标题\n\n![图](a/{}.png)", asset.id);
+
+        assert!(db.save_note_with_assets(&mut row, &body, &root, &[asset]).is_err());
+        let saved = db.note(row.id).unwrap().unwrap();
+        assert_eq!(saved.title.as_deref(), Some("旧标题"));
+        assert_eq!(saved.bytes, old_body.len() as i64);
+        assert_eq!(asset_count(&db, row.id), 0);
+    }
+
+    #[test]
+    fn asset_retry_is_idempotent_and_foreign_ownership_is_rejected() {
+        let d = temp_dir("asset-owner");
+        let mut db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let mut row = db.create_note(&root, "inbox", 7).unwrap();
+        let asset = asset_file(&root, &row, &"e5".repeat(16), b"image");
+        let body = format!("# 图\n\n![图](a/{}.png)", asset.id);
+        db.save_note_with_assets(&mut row, &body, &root, &[asset.clone()]).unwrap();
+        db.save_note_with_assets(&mut row, &body, &root, &[asset.clone()]).unwrap();
+        assert_eq!(asset_count(&db, row.id), 1);
+
+        let mut other = db.create_note(&root, "inbox", 8).unwrap();
+        let mut foreign = asset.clone();
+        foreign.note_id = other.id;
+        assert!(db.save_note_with_assets(&mut other, &body, &root, &[foreign]).is_err());
+        let unchanged = db.note(other.id).unwrap().unwrap();
+        assert_eq!(unchanged.title, None);
+        assert_eq!(unchanged.bytes, 0);
+        assert_eq!(asset_count(&db, row.id), 1);
+        assert_eq!(asset_count(&db, other.id), 0);
+    }
+
+    #[test]
+    fn asset_path_must_stay_beside_the_saved_note() {
+        let d = temp_dir("asset-path");
+        let mut db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let mut row = db.create_note(&root, "inbox", 7).unwrap();
+        let mut asset = asset_file(&root, &row, &"f6".repeat(16), b"image");
+        let escaped = format!("folders/other/notes/a/{}.png", asset.id);
+        let path = root.resolve(&escaped).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"image").unwrap();
+        asset.rel_path = escaped;
+        let body = format!("# 图\n\n![图](a/{}.png)", asset.id);
+
+        assert!(db.save_note_with_assets(&mut row, &body, &root, &[asset]).is_err());
+        assert_eq!(asset_count(&db, row.id), 0);
+        assert_eq!(db.note(row.id).unwrap().unwrap().title, None);
+    }
+
+    #[test]
+    fn image_reference_parser_accepts_exact_targets_and_rejects_lookalikes() {
+        let asset = AssetRow {
+            id: "ab".repeat(16),
+            note_id: 1,
+            kind: AssetKind::Image,
+            rel_path: format!("folders/inbox/notes/a/{}.png", "ab".repeat(16)),
+            source_kind: SourceKind::File,
+            source_ref: String::new(),
+            bytes: 1,
+            width: None,
+            height: None,
+            frames: None,
+            duration_ms: None,
+            sha256: "cd".repeat(32),
+            created_at_ms: 1,
+        };
+        let target = format!("a/{}.png", asset.id);
+        for body in [
+            format!("![图]({target})"),
+            format!("![图](<{target}>)"),
+            format!("![图](./{target}?size=2#preview)"),
+            format!("<img src=\"./{target}?x=1&amp;y=2\">"),
+        ] {
+            assert!(body_references_asset(&body, &asset), "{body}");
+        }
+        for body in [
+            asset.id.clone(),
+            format!("`![图]({target})`"),
+            format!("[链接]({target})"),
+            format!("![图](ba/{target})"),
+            format!("![图](foo/{target})"),
+            format!("![图](a/{}.jpg)", asset.id),
+        ] {
+            assert!(!body_references_asset(&body, &asset), "{body}");
+        }
     }
 }

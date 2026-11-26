@@ -16,6 +16,7 @@
 //! - [`storage`]：`notes.db` 与 `folders/<dir>/notes/<id>.md` 那套数据口径（P1-b）。
 //! - [`runtime`]：插件模式那一格的运行——先握手后建窗、一条连接一个泵线程、把 op 结果递给 UI（P1-c）。
 
+pub(crate) mod attachments;
 pub mod dispatch;
 pub mod endpoints;
 pub mod envelope;
