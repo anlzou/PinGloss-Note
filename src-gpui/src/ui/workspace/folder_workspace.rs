@@ -46,7 +46,7 @@ impl Workspace {
                 if foreground {
                     if let Some(path) = reveal {
                         target.open_batch([OpenRequest {
-                            path: Some(path.to_path_buf()),
+                            target: OpenTarget::Path(path.to_path_buf()),
                             favorite_folder: true,
                             ..Default::default()
                         }], target_window, cx);

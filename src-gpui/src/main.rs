@@ -12,6 +12,7 @@ mod document_export;
 mod editor;
 mod nomo_mark;
 mod open_profile;
+mod provider;
 mod frame_profile;
 #[cfg(feature = "automation")]
 mod automation;

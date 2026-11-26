@@ -125,8 +125,8 @@ impl Workspace {
         for opening in &self.opening {
             if opening.path.as_deref().is_some_and(removed) { opening.request.cancel(); }
         }
-        self.open_requests.pending.retain(|request| !request.path.as_deref().is_some_and(removed));
-        if self.deferred_open.as_ref().and_then(|request| request.path.as_deref()).is_some_and(removed) {
+        self.open_requests.pending.retain(|request| !request.local_path().is_some_and(|path| removed(path)));
+        if self.deferred_open.as_ref().and_then(|request| request.local_path()).is_some_and(|path| removed(path)) {
             self.deferred_open = None;
         }
 

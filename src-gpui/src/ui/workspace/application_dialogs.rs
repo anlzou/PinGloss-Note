@@ -1,5 +1,6 @@
 //! 外部变更、恢复、打开位置及关闭选择；只保存身份和弱生命周期任务，不保存正文。
 use super::*;
+use crate::provider::{dispatch_open_target, OpenDispatch, OpenTarget};
 use crate::text_document::markdown_session::{ExternalChange, RecoveryCandidate};
 use crate::ui::{dialogs::{SecondaryDialog, SecondaryKind, SecondaryAction as A, Tone}, toolbar_i18n::{ToolbarLocale, UiMessage}};
 use std::collections::HashMap;
@@ -120,14 +121,16 @@ impl Workspace {
     }
 
     pub(super) fn route_open_request(&mut self,mut request:OpenRequest,window:&mut Window,cx:&mut Context<Self>) {
-        let Some(path)=request.path.take() else {self.open_request_here(request,window,cx);return;};
         let foreground = request.generation == self.open_requests.generation;
-        if request.favorite_folder {
-            self.open_favorite_folder(path, foreground, window, cx);
-            return;
-        }
+        // provider 目标压根没有路径：借道下面任何一把以路径为主键的尺，都会在本地长出一条洗不掉的假标签。
+        let path=match dispatch_open_target(&request.target,request.favorite_folder) {
+            OpenDispatch::Provider(reference)=>{self.refuse_provider_open(&reference,cx);return;}
+            OpenDispatch::NewDocument=>{self.open_request_here(request,window,cx);return;}
+            OpenDispatch::FavoriteFolder(path)=>{self.open_favorite_folder(path,foreground,window,cx);return;}
+            OpenDispatch::Local(path)=>path,
+        };
         let path=path.canonicalize().unwrap_or(path);
-        request.path=Some(path.clone());
+        request.target=OpenTarget::Path(path.clone());
         if path.is_dir() && self.reuse_open_folder(&path, None, foreground, window, cx) {return;}
         if self.reuse_open_document(&request,window,cx) {return;}
         let current=window.window_handle();

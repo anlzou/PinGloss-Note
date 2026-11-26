@@ -238,7 +238,7 @@ impl Workspace {
                         if matches!(kind, EditKind::NewFile) {
                             workspace.pending_tree_click.take();
                             workspace.deferred_open = None;
-                            workspace.enqueue_open_request(OpenRequest { path: Some(path), newly_created: true, ..Default::default() }, cx);
+                            workspace.enqueue_open_request(OpenRequest { target: OpenTarget::Path(path), newly_created: true, ..Default::default() }, cx);
                             workspace.drain_open_requests(window, cx);
                         }
                     }
@@ -311,11 +311,11 @@ fn broadcast_tree_rename(app: &mut App, paths: &[(PathBuf, PathBuf)], warning: O
             for opening in &mut workspace.opening {
                 if let Some(path) = &mut opening.path { remap_tree_path(path, paths); }
             }
-            if let Some(path) = workspace.deferred_open.as_mut().and_then(|request| request.path.as_mut()) {
+            if let Some(path) = workspace.deferred_open.as_mut().and_then(|request| request.local_path_mut()) {
                 remap_tree_path(path, paths);
             }
             for request in &mut workspace.open_requests.pending {
-                if let Some(path) = &mut request.path { remap_tree_path(path, paths); }
+                if let Some(path) = request.local_path_mut() { remap_tree_path(path, paths); }
             }
             workspace.remap_saved_paths(|path|remap_tree_path(path,paths));
             workspace.home.update(cx, |home, cx| home.paths_renamed(paths, cx));

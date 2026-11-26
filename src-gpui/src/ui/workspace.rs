@@ -12,6 +12,7 @@ use crate::ui::components::{SIDEBAR_ROW_CONTENT_HEIGHT as TREE_ROW_CONTENT_HEIGH
 use crate::ui::file_tree::FileTree;
 use crate::ui::home::{self, Home, HomeEvent, library::{Library, Change as LibraryChange}};
 use crate::nomo_mark::{link_edit::LinkDraft, protocol::ControlError};
+use crate::provider::OpenTarget;
 use crate::ui::editor_popovers::{EditorPopover, EditorPopoverEvent, EditorPopoverKind};
 use crate::ui::text_field::{FieldEvent, TextField};
 use crate::ui::toolbar_i18n::ToolbarLocale;
@@ -338,7 +339,7 @@ impl Workspace {
                 workspace.open_path(path, window, cx);
             },
             HomeEvent::OpenFavoriteFolder(path) => workspace.open_batch([OpenRequest {
-                path: Some(path.clone()),
+                target: OpenTarget::Path(path.clone()),
                 favorite_folder: true,
                 ..Default::default()
             }], window, cx),
@@ -615,7 +616,7 @@ impl Workspace {
 
     fn open_path_now(&mut self, mut request: OpenRequest, window: &mut Window, cx: &mut Context<Self>) {
         if !self.leave_mini(window,cx) {return;}
-        let Some(path) = request.path.take() else { return; };
+        let Some(path) = request.take_local_path() else { return; };
         let generation = request.generation;
         if self.explorer.mutating.iter().any(|busy| path.starts_with(busy)) {self.notice=Some(ToolbarLocale::current(cx).app_text("workspace.fileBusy").into());cx.notify();return;}
         let metadata = path.metadata().ok();
@@ -653,7 +654,7 @@ impl Workspace {
         }
         // 同一路径的过期请求必须先释放会话，才能重新打开。
         if self.opening.iter().any(|opening|opening.path.as_ref()==Some(&path)) {
-            self.deferred_open=Some(OpenRequest { path: Some(path), preview, anchor, ..request });
+            self.deferred_open=Some(OpenRequest { target: OpenTarget::Path(path), preview, anchor, ..request });
             return;
         }
         let source = if request.newly_created { application_dialogs::OpenSource::NewFile } else { application_dialogs::OpenSource::File };
@@ -919,7 +920,7 @@ impl Workspace {
                     workspace.opening.remove(index);
                 }
                 let retry = completed_path.as_ref().is_some_and(|completed| {
-                    workspace.deferred_open.as_ref().and_then(|request| request.path.as_ref()) == Some(completed)
+                    workspace.deferred_open.as_ref().and_then(|request| request.local_path()) == Some(completed)
                 });
                 if let Some(error)=cleanup_error {
                     if retry {workspace.deferred_open=None;}
@@ -1201,7 +1202,7 @@ impl Workspace {
         let response=cx.prompt_for_paths(PathPromptOptions {files:!directories,directories,multiple:!directories,prompt:Some(ToolbarLocale::current(cx).app_text("menu.openFile").into())});
         cx.spawn_in(window,async move |this,cx| {
             if let Ok(Ok(Some(paths)))=response.await {let _=this.update_in(cx,|workspace,window,cx| {
-                let requests = paths.into_iter().map(|path| OpenRequest { path: Some(path), choose_window, ..Default::default() });
+                let requests = paths.into_iter().map(|path| OpenRequest { target: OpenTarget::Path(path), choose_window, ..Default::default() });
                 workspace.open_batch(requests, window, cx);
             });}
         }).detach();

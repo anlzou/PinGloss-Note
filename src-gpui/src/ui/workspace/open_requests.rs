@@ -1,12 +1,13 @@
-//! 打开意图只持有有界路径与目标身份；批量请求串行收尾，正文仍由原会话加载。
+//! 打开意图只持有有界目标身份；批量请求串行收尾，正文仍由原会话加载。
 use super::*;
+use crate::provider::{OpenTarget, ProjectRef};
 use std::collections::VecDeque;
 
 const MAX_PENDING_OPENS: usize = 64;
 
 #[derive(Clone, Default)]
 pub(super) struct OpenRequest {
-    pub path: Option<PathBuf>,
+    pub target: OpenTarget,
     pub preview: bool,
     pub anchor: Option<String>,
     pub choose_window: bool,
@@ -14,6 +15,15 @@ pub(super) struct OpenRequest {
     pub document_only: bool,
     pub favorite_folder: bool,
     pub generation: u64,
+}
+
+impl OpenRequest {
+    /// 本地那把尺：标签去重、跨窗复用、改名映射与删除对账都只认路径，provider 臂一律交不出路径。
+    pub(super) fn local_path(&self) -> Option<&PathBuf> { self.target.path() }
+    pub(super) fn local_path_mut(&mut self) -> Option<&mut PathBuf> { self.target.path_mut() }
+
+    /// 取走路径并把目标降回新建：provider 臂被误调时身份原样留着，不会被这一次取值吞掉。
+    pub(super) fn take_local_path(&mut self) -> Option<PathBuf> { self.target.take_path() }
 }
 
 #[derive(Clone, Default)]
@@ -39,7 +49,7 @@ impl Workspace {
 
     pub fn open_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let requests = paths.into_iter().map(|path| OpenRequest {
-            path: Some(path),
+            target: OpenTarget::Path(path),
             choose_window: true,
             ..Default::default()
         });
@@ -63,7 +73,7 @@ impl Workspace {
         window.defer(cx, move |window, cx| {
             workspace.update(cx, |workspace, cx| {
                 let requests = documents.into_iter().map(|path| OpenRequest {
-                    path: Some(path),
+                    target: OpenTarget::Path(path),
                     document_only: true,
                     ..Default::default()
                 });
@@ -88,12 +98,12 @@ impl Workspace {
     }
 
     pub(super) fn enqueue_open(&mut self, path: Option<PathBuf>, preview: bool, anchor: Option<String>, choose_window: bool, cx: &mut Context<Self>) {
-        self.enqueue_open_request(OpenRequest { path, preview, anchor, choose_window, ..Default::default() }, cx);
+        self.enqueue_open_request(OpenRequest { target: path.map_or(OpenTarget::Blank, OpenTarget::Path), preview, anchor, choose_window, ..Default::default() }, cx);
     }
 
     pub(super) fn enqueue_open_request(&mut self, mut request: OpenRequest, cx: &mut Context<Self>) {
         if self.open_requests.pending.len() >= MAX_PENDING_OPENS
-            || request.path.as_ref().is_some_and(|path| path.as_os_str().len() > 32 * 1024)
+            || request.local_path().is_some_and(|path| path.as_os_str().len() > 32 * 1024)
             || request.anchor.as_ref().is_some_and(|anchor| anchor.len() > 8192)
         {
             self.failure_notice = Some(crate::ui::toolbar_i18n::ToolbarLocale::current(cx).app_text("open.queueFull").into());
@@ -101,7 +111,7 @@ impl Workspace {
             return;
         }
         if self.waiting_library_close { self.waiting_library_close = false; self.cancel_close(cx); }
-        self.cancel_preview_opens(request.path.as_deref());
+        self.cancel_preview_opens(request.local_path().map(PathBuf::as_path));
         // 连续单击预览可合并；显式多选、新建和固定打开都必须保留。
         self.open_requests.pending.retain(|request| !request.preview);
         request.generation = self.next_open_intent();
@@ -127,8 +137,16 @@ impl Workspace {
         }
     }
 
+    /// provider 条目的正文只住在宿主与 Notes 侧车里：控制面客户端接上之前，这条意图停在路由处，
+    /// 不建本地标签、不进 `opening`，也不写 recent。
+    pub(super) fn refuse_provider_open(&mut self, reference: &ProjectRef, cx: &mut Context<Self>) {
+        self.failure_notice = Some(crate::ui::toolbar_i18n::ToolbarLocale::current(cx)
+            .app_format("open.providerUnsupported", &[("provider", reference.provider_id())]).into());
+        cx.notify();
+    }
+
     pub(super) fn open_request_here(&mut self, request: OpenRequest, window: &mut Window, cx: &mut Context<Self>) {
-        if request.path.is_some() {
+        if let OpenTarget::Path(_) = request.target {
             self.open_path_now(request, window, cx);
         } else {
             self.open_document_from(None, false, None, application_dialogs::OpenSource::File, request.generation, window, cx);
@@ -137,7 +155,7 @@ impl Workspace {
 
     /// 跨窗口复用同时覆盖已挂载标签和正在加载的文件，防止第二个 owner 竞争同一会话。
     pub(super) fn reuse_open_document(&mut self, request: &OpenRequest, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(path) = &request.path else { return false; };
+        let Some(path) = request.local_path() else { return false; };
         let foreground=request.generation==self.open_requests.generation;
         let current = window.window_handle();
         for handle in cx.windows().into_iter().filter_map(|handle| handle.downcast::<Workspace>()) {
