@@ -54,6 +54,81 @@ function Invoke-Captured {
     }
 }
 
+function Get-SourceState {
+    $commitResult = Invoke-Captured -File 'git' -Arguments @('rev-parse', 'HEAD')
+    if ($commitResult.Exit -ne 0) { throw '读不出源码 commit' }
+    $commit = ($commitResult.Stdout | Select-Object -First 1).Trim()
+    if ($commit -notmatch '^[0-9a-f]{40}$') { throw "commit 不是 40 位十六进制：$commit" }
+    $statusResult = Invoke-Captured -File 'git' -Arguments @('status', '--porcelain', '--untracked-files=normal')
+    if ($statusResult.Exit -ne 0) { throw '读不出源码工作区状态' }
+    $dirty = @($statusResult.Stdout | Where-Object { $_ -ne '' })
+    $cargoText = Get-Content -LiteralPath (Join-Path $root 'Cargo.toml') -Raw -Encoding UTF8
+    $versionMatch = [regex]::Match($cargoText, '(?m)^version\s*=\s*"([^"]+)"')
+    if (-not $versionMatch.Success) { throw 'Cargo.toml 里读不出 Nomo 版本' }
+    [pscustomobject]@{ Commit = $commit; Dirty = $dirty; Version = $versionMatch.Groups[1].Value }
+}
+
+function Assert-SourceState {
+    param($Expected)
+    $current = Get-SourceState
+    if ($current.Commit -cne $Expected.Commit -or
+        (($current.Dirty -join "`n") -cne ($Expected.Dirty -join "`n"))) {
+        throw '构建或打包期间源码树发生变化；这一趟停止，请重新打包。'
+    }
+}
+
+function Test-SourceRecord {
+    param([string]$Path, [string]$Target, [string]$Commit, [string]$BinarySha256,
+          [string]$Version, [switch]$SkipBuild)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "找不到产物来源记录 $Path；先不带 -SkipBuild 打包一发"
+    }
+    try {
+        $record = (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
+    } catch {
+        throw "产物来源记录读不动：$($_.Exception.Message)"
+    }
+    if ($null -eq $record -or $record -isnot [pscustomobject]) { throw '产物来源记录不是 JSON 对象' }
+    $required = @('schema', 'target', 'commit', 'workspace_clean', 'binary_sha256', 'nomo_version', 'built_at_utc')
+    $missing = @($required | Where-Object { $record.PSObject.Properties.Name -notcontains $_ })
+    if ($missing) { throw "产物来源记录缺字段：$($missing -join ', ')" }
+    if (-not ($record.schema -is [int] -or $record.schema -is [long]) -or $record.schema -ne 1) {
+        throw '不认识的产物来源记录 schema'
+    }
+    if ($record.target -ne $Target) { throw "产物 target 不符：记录 $($record.target)，当前 $Target" }
+    if ($record.commit -cne $Commit) { throw "产物来源 commit 不符：记录 $($record.commit)，当前 $Commit" }
+    if ($record.workspace_clean -isnot [bool]) { throw '产物来源记录的 workspace_clean 不是布尔值' }
+    if ($SkipBuild -and -not $record.workspace_clean) {
+        throw '来源记录来自脏源码树；跳过构建只允许复用干净 commit 的产物'
+    }
+    if ($record.binary_sha256 -ne $BinarySha256) { throw '产物哈希与来源记录不符；二进制可能在记录写入后被改动' }
+    if ($record.nomo_version -ne $Version) { throw "产物版本与 Cargo.toml 不符：记录 $($record.nomo_version)，当前 $Version" }
+    if ($record.built_at_utc -isnot [string] -or [string]::IsNullOrWhiteSpace($record.built_at_utc)) {
+        throw '产物来源记录缺构建时间'
+    }
+}
+
+function Write-SourceRecord {
+    param([string]$Path, [string]$Target, [string]$Commit, [string[]]$Dirty,
+          [string]$BinarySha256, [string]$Version)
+    $record = [ordered]@{
+        schema = 1
+        target = $Target
+        commit = $Commit
+        workspace_clean = ($Dirty.Count -eq 0)
+        binary_sha256 = $BinarySha256
+        nomo_version = $Version
+        built_at_utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }
+    $temporary = "$Path.tmp-$PID"
+    try {
+        [IO.File]::WriteAllText($temporary, (($record | ConvertTo-Json) + "`n"), (New-Object Text.UTF8Encoding $false))
+        Move-Item -LiteralPath $temporary -Destination $Path -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 Push-Location $root
 try {
@@ -92,16 +167,25 @@ try {
     $metadata = Invoke-Captured -File 'cargo' -Arguments @('metadata', '--locked', '--no-deps', '--format-version', '1')
     if ($metadata.Exit -ne 0) { throw 'cargo metadata failed' }
     $target = 'x86_64-pc-windows-msvc'
+    $targetDirectory = (($metadata.Stdout -join "`n") | ConvertFrom-Json).target_directory
+    $binary = Join-Path $targetDirectory "$target/release/nomo.exe"
+    $sourceRecord = Join-Path $targetDirectory "$target/release/nomo.notes-source.json"
+    $sourceState = Get-SourceState
+    $commit = $sourceState.Commit
+    $dirty = $sourceState.Dirty
+    $nomoVersion = $sourceState.Version
+    if ($SkipBuild -and $dirty.Count -gt 0) {
+        throw '当前源码树不干净；跳过构建只允许复用干净 commit 的产物。'
+    }
     if (-not $SkipBuild) {
         Write-Output "[构建] cargo build --locked --release --target $target --bin nomo（首编可达十几分钟，进度落进程结束后回显）"
         $build = Invoke-Captured -File 'cargo' -Arguments @('build', '--locked', '--release', '--target', $target, '--bin', 'nomo')
         # cargo 的人读进度走 stderr，成功也要让终端看见这一路（闸只看退码）。
         foreach ($line in @($build.Stdout) + @($build.Stderr)) { Write-Output $line }
         if ($build.Exit -ne 0) { throw 'Cargo release build failed' }
+        Assert-SourceState $sourceState
     }
     # Nomo 编出来的那颗就叫 `nomo.exe`；进插件树按清单 entry 补平台后缀摆成 `bin/PinGloss-Note x Nomo.exe`（内容同一颗）。
-    $targetDirectory = (($metadata.Stdout -join "`n") | ConvertFrom-Json).target_directory
-    $binary = Join-Path $targetDirectory "$target/release/nomo.exe"
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "找不到产物 $binary（先不带 -SkipBuild 编一发）" }
 
     # ③ 产物闸：.sh 那头是 file(ELF)+ldd，这头对等成 PE 头＋dumpbin。
@@ -121,6 +205,29 @@ try {
     $runtimeImports = @($importedDlls | Where-Object { $_ -match '^(vcruntime|msvcp|concrt)' })
     if ($runtimeImports.Count -ne 1 -or $runtimeImports[0] -ne 'vcruntime140.dll') {
         throw "VC runtime imports changed; update the plugin payload: $runtimeImports"
+    }
+
+    $binSha = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($SkipBuild) {
+        Test-SourceRecord -Path $sourceRecord -Target $target -Commit $commit -BinarySha256 $binSha `
+            -Version $nomoVersion -SkipBuild
+    }
+    # 原产物通过身份与版本检查后才写来源账；随包副本只复核同一颗哈希。
+    $probe = Invoke-Captured -File $binary -Arguments @('--probe')
+    if ($probe.Exit -ne 0) { throw "--probe 退 $($probe.Exit)（应为 0）" }
+    if ($probe.Stderr.Count -ne 0) { $probe.Stderr | ForEach-Object { Write-Warning $_ } }
+    $d = (($probe.Stdout -join "`n").Trim()) | ConvertFrom-Json
+    if ($d.app -ne 'nomo' -or $d.plugin_id -ne 'notes') { throw "自述身份不对：$($d | ConvertTo-Json -Compress)" }
+    if ($d.display_name -ne 'PinGloss-Note x Nomo') { throw "自述联名不对：$($d | ConvertTo-Json -Compress)" }
+    if ($d.mode -ne 'probe' -or $d.protocol -ne 1) { throw "自述模式/协议不对：$($d | ConvertTo-Json -Compress)" }
+    if ($null -ne $d.data_socket -or $null -ne $d.data_dir) { throw "独立手起时 data_socket/data_dir 应为 null：$($d | ConvertTo-Json -Compress)" }
+    if ($d.version -ne $nomoVersion) { throw "二进制自述版本 $($d.version) 与 Cargo.toml $nomoVersion 不符" }
+    Write-Output "[探针] bin/PinGloss-Note x Nomo.exe --probe 交回联名自述、退 0（Nomo 版本 $($d.version)）"
+    Assert-SourceState $sourceState
+    if (-not $SkipBuild) {
+        Write-SourceRecord -Path $sourceRecord -Target $target -Commit $commit -Dirty $dirty `
+            -BinarySha256 $binSha -Version $nomoVersion
+        Test-SourceRecord -Path $sourceRecord -Target $target -Commit $commit -BinarySha256 $binSha -Version $nomoVersion
     }
 
     # ④ 组装随包树（.sh 的 install -m 644/755 在这头就是 Copy-Item；执行位是 unix 的事）。
@@ -158,21 +265,11 @@ try {
 
     # ⑤' 源码要约当趟生成：commit、产物 sha256、构建命令与工作区状态都取现场，不抄静态纸。
     $staged = Join-Path $pluginDir 'bin/PinGloss-Note x Nomo.exe'
-    $commitResult = Invoke-Captured -File 'git' -Arguments @('rev-parse', 'HEAD')
-    if ($commitResult.Exit -ne 0) { throw '读不出源码 commit' }
-    $commit = ($commitResult.Stdout | Select-Object -First 1).Trim()
-    if ($commit -notmatch '^[0-9a-f]{40}$') { throw "commit 不是 40 位十六进制：$commit" }
+    Assert-SourceState $sourceState
     $remoteResult = Invoke-Captured -File 'git' -Arguments @('remote', 'get-url', 'origin')
     $sourceUrl = if ($remoteResult.Exit -eq 0) { ($remoteResult.Stdout | Select-Object -First 1).Trim() } else { '' }
-    $cargoText = Get-Content -LiteralPath (Join-Path $root 'Cargo.toml') -Raw -Encoding UTF8
-    $versionMatch = [regex]::Match($cargoText, '(?m)^version\s*=\s*"([^"]+)"')
-    if (-not $versionMatch.Success) { throw 'Cargo.toml 里读不出 Nomo 版本' }
-    $nomoVersion = $versionMatch.Groups[1].Value
-    $binSha = (Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToLowerInvariant()
     $builtAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-    $statusResult = Invoke-Captured -File 'git' -Arguments @('status', '--porcelain', '--untracked-files=normal')
-    if ($statusResult.Exit -ne 0) { throw '读不出打包时的工作区状态' }
-    $dirty = @($statusResult.Stdout | Where-Object { $_ -ne '' })
+    # 来源账绑定这次构建的源码状态；脏树仍可当趟打包，但 SOURCE.md 明写不保证复现。
     if ($dirty.Count -gt 0) {
         $workspaceState = "**有 $($dirty.Count) 处未提交或未跟踪改动** ⇒ commit 记不下这一趟的改动，照构建命令重编**不保证**复现出同一个 sha256"
         Write-Warning "工作区有 $($dirty.Count) 处改动 ⇒ SOURCE.md 明写不保证复现。"
@@ -261,18 +358,10 @@ corresponding source is the repository at the commit above.
     }
     Write-Output "[清单] plugin.json 十一位齐＋display_name 在场、version=$($m.version)、min_host=$($m.min_host)、七条 op 与 runtime handler 一致"
 
-    # ⑥ 自证②：那颗产物独立手起 `--probe` 要吐一份自述 JSON、退 0（不碰显示、不碰数据面）。
-    # 没有宿主 spawn 的两格 env ⇒ `data_socket`／`data_dir` 该是 null，不是错——装机的人据此分得清「没装好」。
+    # 原产物已通过身份与版本检查；随包副本须与原产物哈希一致。
     $staged = Join-Path $pluginDir 'bin/PinGloss-Note x Nomo.exe'
-    $probe = Invoke-Captured -File $staged -Arguments @('--probe')
-    if ($probe.Exit -ne 0) { throw "--probe 退 $($probe.Exit)（应为 0）" }
-    if ($probe.Stderr.Count -ne 0) { $probe.Stderr | ForEach-Object { Write-Warning $_ } }
-    $d = (($probe.Stdout -join "`n").Trim()) | ConvertFrom-Json
-    if ($d.app -ne 'nomo' -or $d.plugin_id -ne 'notes') { throw "自述身份不对：$($d | ConvertTo-Json -Compress)" }
-    if ($d.display_name -ne 'PinGloss-Note x Nomo') { throw "自述联名不对：$($d | ConvertTo-Json -Compress)" }
-    if ($d.mode -ne 'probe' -or $d.protocol -ne 1) { throw "自述模式/协议不对：$($d | ConvertTo-Json -Compress)" }
-    if ($null -ne $d.data_socket -or $null -ne $d.data_dir) { throw "独立手起时 data_socket/data_dir 应为 null：$($d | ConvertTo-Json -Compress)" }
-    Write-Output "[探针] bin/PinGloss-Note x Nomo.exe --probe 交回联名自述、退 0（Nomo 版本 $($d.version)）"
+    $stagedSha = (Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($stagedSha -ne $binSha) { throw '随包二进制与来源账不是同一颗' }
 
     # ⑦ 自证③：许可树齐备，SOURCE.md 的 commit／sha256／工作区／构建命令与当趟读数逐项对账。
     $licenseHead = (Get-Content -LiteralPath (Join-Path $pluginDir 'LICENSE') -Encoding UTF8 -TotalCount 1)
@@ -290,6 +379,7 @@ corresponding source is the repository at the commit above.
     if ($m.license.required -ne $false -or $m.license.trial_days -ne 0) { throw '清单 license 应保持 required=false、trial_days=0' }
     Write-Output "[许可] AGPL 原文＋五份组件许可＋SOURCE.md（commit $($commit.Substring(0,9))、sha256 现场复核）"
 
+    Assert-SourceState $sourceState
     Write-Output "Nomo notes 插件随包树: $pluginDir"
 } finally {
     Pop-Location

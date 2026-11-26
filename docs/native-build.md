@@ -80,7 +80,9 @@ cargo test --locked --release --bin nomo
 cargo test --locked --release --features nomo-mark-demo --bin nomo
 ```
 
-指定 `--target` 时产物在 `target/<target>/release/`，否则在 `target/release/`。两种 feature 配置使用同一二进制名：打包脚本始终重新构建默认配置。`--skip-build`／`-SkipBuild` 仅用于已确认默认产物的本地重复打包。
+指定 `--target` 时产物在 `target/<target>/release/`，否则在 `target/release/`。两种 feature 配置使用同一二进制名：打包脚本始终重新构建默认配置。
+
+notes 插件随包脚本 `scripts/package-notes-plugin.sh`／`scripts/package-notes-plugin.ps1` 默认重新构建默认 Release，并在产物旁写入 `nomo.notes-source.json`，记录 target、commit、构建时工作区是否干净、二进制 SHA-256、Nomo 版本和构建时间。`--skip-build`／`-SkipBuild` 只允许复用来源账完整、来源工作区干净且与当前 commit／target／二进制哈希／版本全部一致的产物；缺账、旧 commit、脏树、来源为脏树或产物被改动都会拒绝打包。首次使用这一版脚本须先正常构建一次。来源账是本地构建台账，不是签名或密码学认证；构建与打包过程复核的是 HEAD 和 `git status --porcelain` 快照，不承诺识别同一 dirty 状态下的内容替换或共享 target 的并发改写。
 
 ### Windows x64
 

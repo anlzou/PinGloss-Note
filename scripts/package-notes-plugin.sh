@@ -43,6 +43,97 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 target=x86_64-unknown-linux-gnu
 target_dir="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.target_directory')"
+source_record="$target_dir/$target/release/nomo.notes-source.json"
+
+read_source_state() {
+  commit="$(git -C "$root" rev-parse HEAD)"
+  [[ ${#commit} -eq 40 && "$commit" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "读不出 40 位的源码 commit（$commit）" >&2
+    exit 1
+  }
+  dirty="$(git -C "$root" status --porcelain --untracked-files=normal)"
+  nomo_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+  [[ -n "$nomo_version" ]] || { echo 'Cargo.toml 里读不出 Nomo 版本' >&2; exit 1; }
+}
+
+assert_source_state_unchanged() {
+  local current_commit current_dirty
+  current_commit="$(git -C "$root" rev-parse HEAD)"
+  current_dirty="$(git -C "$root" status --porcelain --untracked-files=normal)"
+  [[ "$current_commit" == "$commit" && "$current_dirty" == "$dirty" ]] || {
+    echo '构建或打包期间源码树发生变化；这一趟停止，请重新打包。' >&2
+    exit 1
+  }
+}
+
+verify_source_record() {
+  python3 - "$source_record" "$target" "$commit" "$bin_sha" "$nomo_version" "$skip_build" <<'PY'
+import json, sys
+from pathlib import Path
+
+path, target, commit, bin_sha, version, skip_build = sys.argv[1:]
+try:
+    record = json.loads(Path(path).read_text(encoding="utf-8"))
+except FileNotFoundError:
+    raise SystemExit(f"找不到产物来源记录 {path}；先不带 --skip-build 打包一发")
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"产物来源记录读不动：{error}")
+if not isinstance(record, dict):
+    raise SystemExit("产物来源记录不是 JSON 对象")
+required = {"schema", "target", "commit", "workspace_clean", "binary_sha256", "nomo_version", "built_at_utc"}
+missing = sorted(required - record.keys())
+if missing:
+    raise SystemExit(f"产物来源记录缺字段：{', '.join(missing)}")
+if type(record["schema"]) is not int or record["schema"] != 1:
+    raise SystemExit("不认识的产物来源记录 schema")
+if record["target"] != target:
+    raise SystemExit(f"产物 target 不符：记录 {record['target']}，当前 {target}")
+if record["commit"] != commit:
+    raise SystemExit(f"产物来源 commit 不符：记录 {record['commit']}，当前 {commit}")
+if type(record["workspace_clean"]) is not bool:
+    raise SystemExit("产物来源记录的 workspace_clean 不是布尔值")
+if skip_build == "true" and not record["workspace_clean"]:
+    raise SystemExit("来源记录来自脏源码树；跳过构建只允许复用干净 commit 的产物")
+if record["binary_sha256"] != bin_sha:
+    raise SystemExit("产物哈希与来源记录不符；二进制可能在记录写入后被改动")
+if record["nomo_version"] != version:
+    raise SystemExit(f"产物版本与 Cargo.toml 不符：记录 {record['nomo_version']}，当前 {version}")
+if not isinstance(record["built_at_utc"], str) or not record["built_at_utc"]:
+    raise SystemExit("产物来源记录缺构建时间")
+PY
+}
+
+write_source_record() {
+  python3 - "$source_record" "$target" "$commit" "$dirty" "$bin_sha" "$nomo_version" <<'PY'
+import json, os, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path, target, commit, dirty, bin_sha, version = sys.argv[1:]
+record = {
+    "schema": 1,
+    "target": target,
+    "commit": commit,
+    "workspace_clean": not dirty,
+    "binary_sha256": bin_sha,
+    "nomo_version": version,
+    "built_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+destination = Path(path)
+temporary = destination.with_name(destination.name + f".tmp-{os.getpid()}")
+try:
+    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, destination)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+}
+
+read_source_state
+if $skip_build && [[ -n "$dirty" ]]; then
+  echo '当前源码树不干净；跳过构建只允许复用干净 commit 的产物。' >&2
+  exit 1
+fi
 
 if ! $skip_build; then
   # GPUI 的 x11 那一头在链接期点名 `-lxkbcommon-x11`，而链接器只认 dev 符号链
@@ -68,6 +159,7 @@ if ! $skip_build; then
   done
   echo "[构建] cargo build --locked --release --target $target --bin nomo"
   cargo build --locked --release --target "$target" --bin nomo
+  assert_source_state_unchanged
 fi
 # Nomo 编出来的那颗就叫 `nomo`；进插件树按清单 entry 改名为 `bin/PinGloss-Note x Nomo`（内容同一颗）。
 binary="$target_dir/$target/release/nomo"
@@ -76,6 +168,26 @@ file "$binary" | grep -q 'ELF 64-bit.*x86-64'
 if ldd "$binary" | grep 'not found'; then
   echo 'Missing shared libraries' >&2
   exit 1
+fi
+bin_sha="$(sha256sum "$binary" | cut -c1-64)"
+if $skip_build; then
+  verify_source_record
+fi
+probe="$("$binary" --probe)"
+python3 - "$probe" "$nomo_version" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["app"] == "nomo" and d["plugin_id"] == "notes", d
+assert d["display_name"] == "PinGloss-Note x Nomo", d
+assert d["mode"] == "probe" and d["protocol"] == 1, d
+assert d["data_socket"] is None and d["data_dir"] is None, d
+assert d["version"] == sys.argv[2], f"二进制自述版本 {d['version']} 与 Cargo.toml {sys.argv[2]} 不符"
+print(f"[探针] bin/PinGloss-Note x Nomo --probe 交回联名自述、退 0（Nomo 版本 {d['version']}）")
+PY
+assert_source_state_unchanged
+if ! $skip_build; then
+  write_source_record
+  verify_source_record
 fi
 
 stamp="$(date +%Y%m%d-%H%M%S)"
@@ -109,16 +221,12 @@ done
 # ④ 源码那一纸是**当趟生成**的，不写死：commit、构建命令、产物 sha256、打包时间都取自现场 ——
 #    AGPL-3.0 §13 要的是"随二进制交出完整对应源码，或 §11 那一条书面要约"，而要约要能对上号：
 #    拿到的那一颗算得出 sha256、并且指得回某一枚 commit，这一纸才算数，抄一份静态文本不算。
-commit="$(git -C "$root" rev-parse HEAD)"
+assert_source_state_unchanged
 source_url="$(git -C "$root" remote get-url origin 2>/dev/null || echo '')"
-nomo_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
 plugin_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["version"])' \
   "$stage/$plugin_rel/plugin.json")"
-bin_sha="$(sha256sum "$stage/$plugin_rel/bin/PinGloss-Note x Nomo" | cut -c1-64)"
 built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-# 纸上那句"sha256 与源码一一对应"只在树干净时成立：未提交的改动不进 commit，抄上去就成了假账。
-# `--skip-build` 那一趟更容易碰见（产物是早先那次构建留下的），所以这一位现读、把话头跟着收。
-dirty="$(git -C "$root" status --porcelain --untracked-files=normal)"
+# 来源账绑定这次构建的源码状态；脏树仍可当趟打包，但 SOURCE.md 明写不保证复现。
 if [[ -n "$dirty" ]]; then
   n="$(printf '%s\n' "$dirty" | grep -c '')"
   workspace_state="**有 $n 处未提交改动** ⇒ 上面的 commit 记不下这一趟的改动，那一行构建命令照原样重编**不保证**复现出同一个 sha256"
@@ -126,7 +234,6 @@ if [[ -n "$dirty" ]]; then
 else
   workspace_state="干净，就是上面那一枚 commit 的那棵树 ⇒ 照上面的构建命令重编应能复现同一个 sha256"
 fi
-[[ ${#commit} -eq 40 ]] || { echo "读不出 40 位的 commit（$commit）⇒ 源码那一纸指不回去" >&2; exit 1; }
 [[ -n "$source_url" ]] || echo "[提示] 这一份 clone 没有 origin remote ⇒ 要约里只留 commit，索取方式写邮件那条。" >&2
 cat > "$stage/$plugin_rel/SOURCE.md" <<EOF
 # \`notes\` 插件包的许可与源码声明
@@ -211,18 +318,10 @@ for op in expected:
 print(f"[清单] plugin.json 十一位齐＋display_name 在场、version={m['version']}、min_host={m['min_host']}、七条 op 与 runtime handler 一致")
 PY
 
-# 自证②：那颗产物独立手起 `--probe` 要吐一份自述 JSON、退 0（不碰显示、不碰数据面；口径同 `pingloss-todo`）。
-# 没有宿主 spawn 的两格 env ⇒ `data_socket`／`data_dir` 该是 null，不是错——装机的人据此分得清「没装好」。
-probe="$("$stage/$plugin_rel/bin/PinGloss-Note x Nomo" --probe)"
-python3 - "$probe" <<'PY'
-import json, sys
-d = json.loads(sys.argv[1])
-assert d["app"] == "nomo" and d["plugin_id"] == "notes", d
-assert d["display_name"] == "PinGloss-Note x Nomo", d
-assert d["mode"] == "probe" and d["protocol"] == 1, d
-assert d["data_socket"] is None and d["data_dir"] is None, d
-print(f"[探针] bin/PinGloss-Note x Nomo --probe 交回联名自述、退 0（Nomo 版本 {d['version']}）")
-PY
+# 原产物已通过身份与版本检查；随包副本须与原产物哈希一致。
+staged="$stage/$plugin_rel/bin/PinGloss-Note x Nomo"
+staged_sha="$(sha256sum "$staged" | cut -c1-64)"
+[[ "$staged_sha" == "$bin_sha" ]] || { echo '随包二进制与来源账不是同一颗' >&2; exit 1; }
 
 # 自证③：许可那三位齐备、且**这一趟的**读数写在纸上（D-A②／§5.4 第 5 条那一句的出口）。
 #   · `LICENSE` 首行是 AGPL 的抬头（搬错文件＝首行不对）；
@@ -258,4 +357,5 @@ print(f"[许可] LICENSE（AGPL 原文）＋ licenses/ 四份组件许可＋ SOU
       f"（copyleft 随包与宿主的授权闸是两件事）")
 PY
 
+assert_source_state_unchanged
 echo "Nomo notes 插件随包树: $stage/$plugin_rel"
