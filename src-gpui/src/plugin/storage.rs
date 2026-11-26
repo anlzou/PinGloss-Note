@@ -156,6 +156,35 @@ pub struct Db {
     conn: Connection,
 }
 
+/// 正文改名失败时，调用方据此决定是否保留正式会话的恢复意图。
+#[derive(Debug)]
+pub struct RenameBodyError {
+    message: String,
+    rollback_failed: bool,
+}
+
+impl RenameBodyError {
+    fn recovered(message: impl Into<String>) -> Self {
+        Self { message: message.into(), rollback_failed: false }
+    }
+
+    fn recovery_required(message: impl Into<String>) -> Self {
+        Self { message: message.into(), rollback_failed: true }
+    }
+
+    pub fn rollback_failed(&self) -> bool {
+        self.rollback_failed
+    }
+}
+
+impl std::fmt::Display for RenameBodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RenameBodyError {}
+
 impl Db {
     /// 开库并跑迁移：先读 `PRAGMA user_version`，比 [`SCHEMA_VERSION`] **新**就整个拒（一个字都不写）。
     ///
@@ -287,9 +316,8 @@ impl Db {
         Ok(())
     }
 
-    /// 把正文文件就地改名（保留旧扩展名、默认 `md`），再把新 `body_path` 落回那一行；
-    /// **DB 失败就回滚磁盘改名**。私有行拒绝。不碰标题、不碰信封——改的是**物理文件名**。
-    pub fn rename_body(&self, root: &Root, row: &NoteRow, stem: &str) -> Res<PathBuf> {
+    /// 先算好改名的两端，供已打开文档的会话在同一把路径锁内更新基线。
+    pub fn rename_target(&self, root: &Root, row: &NoteRow, stem: &str) -> Res<(PathBuf, PathBuf)> {
         if row.enc.is_private() {
             return Err("私有笔记改名今天没接线".to_string());
         }
@@ -305,26 +333,50 @@ impl Db {
             .and_then(|e| e.to_str())
             .unwrap_or(BODY_EXT)
             .to_string();
-        let new_name = format!("{stem}.{ext}");
-        let new_abs = old_abs.with_file_name(&new_name);
+        let new_abs = old_abs.with_file_name(format!("{stem}.{ext}"));
         if new_abs.exists() {
-            return Err(format!("目标 {new_name} 已存在，改名不覆盖"));
+            return Err(format!("目标 {}.{ext} 已存在，改名不覆盖", stem));
         }
-        std::fs::rename(&old_abs, &new_abs).es()?;
+        Ok((old_abs, new_abs))
+    }
+
+    /// 把正文文件就地改名（保留旧扩展名、默认 `md`），再把新 `body_path` 落回那一行；
+    /// **DB 失败就回滚磁盘改名**。私有行拒绝。不碰标题、不碰信封——改的是**物理文件名**。
+    pub fn rename_body(&self, root: &Root, row: &NoteRow, stem: &str) -> Res<PathBuf> {
+        self.rename_body_for_session(root, row, stem)
+            .map_err(|error| error.to_string())
+    }
+
+    /// 与 [`Db::rename_body`] 同一趟改名，同时把回滚结果交给已打开文档的恢复流程。
+    pub fn rename_body_for_session(
+        &self,
+        root: &Root,
+        row: &NoteRow,
+        stem: &str,
+    ) -> Result<PathBuf, RenameBodyError> {
+        let (old_abs, new_abs) = self.rename_target(root, row, stem)
+            .map_err(RenameBodyError::recovered)?;
+        std::fs::rename(&old_abs, &new_abs)
+            .map_err(|error| RenameBodyError::recovered(format!("移动正文失败：{error}")))?;
         let rel = rel_under(root, &new_abs);
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE notes SET body_path=?1 WHERE id=?2 AND folder_id=?3 AND enc=?4",
-                params![rel, row.id, row.folder_id, row.enc.bit()],
-            )
-            .es()?;
+        let rollback = |message: String| match std::fs::rename(&new_abs, &old_abs) {
+            Ok(()) => RenameBodyError::recovered(format!("{message}，已回滚文件")),
+            Err(error) => RenameBodyError::recovery_required(format!(
+                "{message}；回滚文件也失败：{error}，恢复意图需保留"
+            )),
+        };
+        let changed = match self.conn.execute(
+            "UPDATE notes SET body_path=?1 WHERE id=?2 AND folder_id=?3 AND enc=?4",
+            params![rel, row.id, row.folder_id, row.enc.bit()],
+        ) {
+            Ok(changed) => changed,
+            Err(error) => return Err(rollback(format!("改名落库失败：{error}"))),
+        };
         if changed == 0 {
-            let _ = std::fs::rename(&new_abs, &old_abs);
-            return Err(format!(
-                "改名落库失败（第 {} 号身份对不上），已回滚文件",
+            return Err(rollback(format!(
+                "改名落库失败（第 {} 号身份对不上）",
                 row.id
-            ));
+            )));
         }
         Ok(new_abs)
     }
@@ -838,6 +890,27 @@ mod tests {
         assert!(!old_abs.exists(), "旧名该没了");
         let back = conn.note(row.id).unwrap().unwrap();
         assert!(back.body_path.ends_with("新名.md"), "{}", back.body_path);
+    }
+
+    #[test]
+    fn rename_rolls_back_when_the_sql_update_fails() {
+        let d = temp_dir("rename-sql-fail");
+        let db = d.path().join("notes.db");
+        let mut conn = Db::open(&db).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let row = conn.create_note(&root, "inbox", 7).unwrap();
+        let old_abs = root.resolve(&row.body_path).unwrap();
+        conn.conn.execute_batch(
+            "CREATE TRIGGER reject_body_path BEFORE UPDATE OF body_path ON notes \
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        ).unwrap();
+
+        let error = conn.rename_body(&root, &row, "新名").unwrap_err();
+        assert!(error.contains("已回滚文件"), "{error}");
+        assert!(old_abs.exists(), "SQL 失败后旧文件必须回来");
+        assert!(!old_abs.with_file_name("新名.md").exists(), "SQL 失败后新文件不能留下");
+        let back = conn.note(row.id).unwrap().unwrap();
+        assert_eq!(back.body_path, row.body_path, "SQL 失败后数据库路径必须保持旧值");
     }
 
     #[test]
