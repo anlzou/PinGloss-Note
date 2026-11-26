@@ -12,8 +12,25 @@ struct RenameIntent {
     baseline_unchanged: bool,
 }
 
+#[derive(Debug)]
 pub(crate) struct RenameOutcome {
     pub warning: Option<String>,
+}
+
+/// 磁盘改名失败后，恢复意图是否仍需保留。
+pub(crate) struct RenameAttemptError {
+    message: String,
+    preserve_intent: bool,
+}
+
+impl RenameAttemptError {
+    pub(crate) fn recovered(message: impl Into<String>) -> Self {
+        Self { message: message.into(), preserve_intent: false }
+    }
+
+    pub(crate) fn recovery_required(message: impl Into<String>) -> Self {
+        Self { message: message.into(), preserve_intent: true }
+    }
 }
 
 fn same_file_id(before: &BaselineIdentity, after: &BaselineIdentity) -> bool {
@@ -77,7 +94,7 @@ impl MarkdownDocumentSessionManager {
         &self,
         source: &Path,
         destination: &Path,
-        rename: impl FnOnce() -> Result<(), String>,
+        rename: impl FnOnce() -> Result<(), RenameAttemptError>,
     ) -> Result<RenameOutcome, String> {
         let _paths = lock(&self.path_operations).map_err(|error| error.message)?;
         let mut handles: Vec<_> = lock(&self.sessions).map_err(|error| error.message)?
@@ -131,8 +148,10 @@ impl MarkdownDocumentSessionManager {
             written.push(path);
         }
         if let Err(error) = rename() {
-            for path in &written { let _ = remove_intent(path); }
-            return Err(error);
+            if !error.preserve_intent {
+                for path in &written { let _ = remove_intent(path); }
+            }
+            return Err(error.message);
         }
         let mut warnings = Vec::new();
         for (index, intent) in plans {

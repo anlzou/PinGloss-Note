@@ -273,7 +273,10 @@ fn move_tree_path(item: &crate::ui::path_drag::PathDrag, root: &Path, directory:
     if source.parent() == Some(parent.as_path()) { return Err(UiMessage::new("home.moveSameFolder")); }
     let name = source.file_name().ok_or_else(|| UiMessage::new("tree.invalidTarget"))?;
     let destination = parent.join(name);
-    let outcome = manager.rename_path(&source, &destination, || rename_no_replace(&source, &destination).map_err(|error| error.to_string()))
+    let outcome = manager.rename_path(&source, &destination, || {
+        rename_no_replace(&source, &destination)
+            .map_err(|error| crate::text_document::markdown_session::RenameAttemptError::recovered(error.to_string()))
+    })
         .map_err(|error| UiMessage::raw(error).context("home.moveFailed"))?;
     let logical = (item.path.clone(), directory.join(name));
     let mut paths = vec![(source, destination)];
@@ -287,7 +290,8 @@ fn rename_tree_path(root: &Path, path: &Path, name: &str, manager: &MarkdownDocu
     let destination = source.parent().ok_or(UiMessage::new("tree.noParent"))?.join(name);
     if source == destination { return Ok(TreeRenameReport { paths: Vec::new(), warning: None }); }
     let outcome = manager.rename_path(&source, &destination, || {
-        rename_no_replace(&source, &destination).map_err(|error| error.to_string())
+        rename_no_replace(&source, &destination)
+            .map_err(|error| crate::text_document::markdown_session::RenameAttemptError::recovered(error.to_string()))
     }).map_err(|error| UiMessage::raw(error).context("tree.renameFailed"))?;
     let mut paths = vec![(source, destination)];
     let logical = (path.to_path_buf(), path.with_file_name(name));

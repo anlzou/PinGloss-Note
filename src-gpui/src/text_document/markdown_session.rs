@@ -16,6 +16,7 @@ pub(crate) use code_view::CodeViewState;
 pub(crate) use external::ExternalChange;
 pub(crate) use delete::{DeleteDocument, DeleteReport};
 pub(crate) use recovery::{RecoveryCandidate, SessionLease};
+pub(crate) use rename::RenameAttemptError;
 #[cfg(test)]
 mod templates;
 use super::{
