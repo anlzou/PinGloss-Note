@@ -9,9 +9,9 @@
 //! 而 `accept` 里那次握手**允许**阻塞到 `hello_budget`：握手是「起来那一下」的事，宿主最多等 5 s 就判死
 //! 这条连接，Slint/GPUI 循环还没转起来时它本来就该占着这根线程。
 //!
-//! ⚠ **`host_version` 由调用方给，本模块不猜**：宿主今天没把它塞进环境或命令行；填什么是宿主那一发
-//! （M13/发6）的决定，写死在这里就成了「库知道宿主是谁」。
+//! ⚠ **`host_version` 由调用方给，本模块不猜**：运行时从宿主 spawn 的环境变量读取，缺位留空。
 
+use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::plugin::dispatch::{answer_of, Dispatch, HostReply, Step};
 use crate::plugin::envelope::Envelope;
 use crate::plugin::handshake::{Hello, HelloOk, PROTOCOL};
-use crate::plugin::transport::{Listener, Stream};
+use crate::plugin::transport::{Listener, Stream, WaitError};
 
 /// 这一颗插件自报的那三位（`Hello` 里除 `protocol`／`pid` 以外的全部来源）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +71,23 @@ impl Server {
     }
 }
 
+/// 插件向宿主发请求失败：超时只是这一趟通知落空，传输坏了则整条连接必须作废。
+#[derive(Debug)]
+pub enum RequestError {
+    TimedOut(String),
+    Broken(String),
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut(message) | Self::Broken(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
+
 /// 一条握过手的连接。
 pub struct Session {
     stream: Stream,
@@ -93,11 +110,12 @@ impl Session {
             host_version: identity.host_version.clone(),
             pid: std::process::id(),
         };
+        let deadline = Instant::now() + hello_budget;
         stream
-            .send(&hello)
+            .send_with_budget(&hello, hello_budget)
             .map_err(|e| format!("把 Hello 发给宿主时断了：{e}"))?;
         let value = stream
-            .wait_msg(hello_budget)
+            .wait_msg(deadline.saturating_duration_since(Instant::now()))
             .map_err(|e| format!("在预算内没等到宿主的 HelloOk：{e}"))?;
         let accepted: HelloOk =
             serde_json::from_value(value).map_err(|e| format!("宿主的 HelloOk 解不开：{e}"))?;
@@ -109,6 +127,8 @@ impl Session {
                 accepted.protocol
             ));
         }
+        // Windows 的挂起读归属发起线程；交给泵线程之前先收净，已到的字节仍压进框帧器。
+        stream.settle().map_err(|e| format!("握手后收净数据面读失败：{e}"))?;
         Ok(Self {
             stream,
             accepted,
@@ -144,9 +164,7 @@ impl Session {
     where
         H: FnMut(&str, Value) -> Dispatch,
     {
-        if !self.stream.poll()? {
-            return Ok(Step::Closed);
-        }
+        let open = self.stream.poll()?;
         while let Some(value) = self.stream.next_msg()? {
             let Ok(envelope) = Envelope::from_value(&value) else {
                 continue;
@@ -165,42 +183,61 @@ impl Session {
                 .map_err(|e| format!("第 {request} 号（{op}）的答复没发出去：{e}"))?;
             return Ok(Step::Served { request, op });
         }
-        Ok(Step::Idle)
+        if open {
+            Ok(Step::Idle)
+        } else {
+            Ok(Step::Closed)
+        }
     }
 
     /// 插件这一侧发一条 `host.*` 请求并等它那一条答复。
     ///
     /// 等答复的空档里宿主若发来一条请求，照 [`Session::pump`] 那一形交给 `handler` 并当场回话 ——
-    /// 宿主那一侧正卡在这趟往返上，不回话就是两边互等。预算用完交 `Err`；配不回号的答复是上一趟留下的尾巴，丢掉。
-    pub fn request<H>(&mut self, handler: &mut H, op: &str, payload: Value, budget: Duration) -> Result<HostReply, String>
+    /// 宿主那一侧正卡在这趟往返上，不回话就是两边互等。预算用完只是这一趟落空；发送、读取或反向答复
+    /// 发送失败都证明字节流不能再用，交 [`RequestError::Broken`]。配不回号的答复是上一趟留下的尾巴，丢掉。
+    pub fn request<H>(
+        &mut self,
+        handler: &mut H,
+        op: &str,
+        payload: Value,
+        budget: Duration,
+    ) -> Result<HostReply, RequestError>
     where
         H: FnMut(&str, Value) -> Dispatch,
     {
         let request = self.next_request;
         self.next_request += 1;
+        let deadline = Instant::now() + budget;
         self.stream
-            .send(
+            .send_with_budget(
                 &Envelope::Request {
                     request,
                     op: op.to_string(),
                     payload,
                 }
                 .to_value(),
+                budget,
             )
-            .map_err(|e| format!("第 {request} 号（{op}）请求没发出去：{e}"))?;
-        let deadline = Instant::now() + budget;
+            .map_err(|e| {
+                RequestError::Broken(format!("第 {request} 号（{op}）请求没发出去：{e}"))
+            })?;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(format!(
+                return Err(RequestError::TimedOut(format!(
                     "宿主无响应：{} ms 内没答第 {request} 号（{op}）",
                     budget.as_millis()
-                ));
+                )));
             }
-            let value = self
-                .stream
-                .wait_msg(remaining)
-                .map_err(|e| format!("等第 {request} 号（{op}）的答复时断了：{e}"))?;
+            let value = self.stream.wait_msg_typed(remaining).map_err(|error| match error {
+                WaitError::TimedOut => RequestError::TimedOut(format!(
+                    "宿主无响应：{} ms 内没答第 {request} 号（{op}）",
+                    remaining.as_millis()
+                )),
+                WaitError::Broken(error) => RequestError::Broken(format!(
+                    "等第 {request} 号（{op}）的答复时连接或字节流坏了：{error}"
+                )),
+            })?;
             let Ok(envelope) = Envelope::from_value(&value) else {
                 continue;
             };
@@ -222,9 +259,14 @@ impl Session {
                     payload,
                 } => {
                     let answer = answer_of(reverse, handler(&op, payload));
+                    let remaining = deadline.saturating_duration_since(Instant::now());
                     self.stream
-                        .send(&answer.to_value())
-                        .map_err(|e| format!("第 {reverse} 号（{op}）的答复没发出去：{e}"))?;
+                        .send_with_budget(&answer.to_value(), remaining)
+                        .map_err(|e| {
+                            RequestError::Broken(format!(
+                                "第 {reverse} 号（{op}）的答复没发出去：{e}"
+                            ))
+                        })?;
                 }
                 // 上一趟超时/断掉留下的答复尾巴：号配不上，也不为它判连接错位。
                 _ => {}
@@ -253,9 +295,27 @@ mod tests {
 
     /// 一条私有 socket 名字（判据专用，绝不指到用户桌面上真在跑的那颗）。
     fn site_socket(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nomo-plugin-{tag}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join(format!("plugin-{tag}.sock"))
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(
+                r"\\.\pipe\nomo-session-test-{tag}-{}",
+                std::process::id()
+            ))
+        }
+        #[cfg(not(windows))]
+        {
+            let dir = std::env::temp_dir().join(format!("nomo-plugin-{tag}-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join(format!("plugin-{tag}.sock"))
+        }
+    }
+
+    fn cleanup_site(_path: &Path) {
+        #[cfg(not(windows))]
+        {
+            let _ = std::fs::remove_file(_path);
+            let _ = std::fs::remove_dir_all(_path.parent().unwrap());
+        }
     }
 
     /// 把一颗正在听、且已经握完手的插件搬上另一条线程，办过的条数留在交件里。
@@ -329,6 +389,215 @@ mod tests {
         drop(host);
         let served = handle.join().expect("夹具线程不该 panic");
         assert_eq!(served, 1, "正好办成一条");
-        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+        cleanup_site(&socket);
+    }
+
+    /// 宿主发完最后一请求就关线：先吸到 EOF，`pump` 仍要先办缓冲里的请求，不能提前报关闭。
+    #[test]
+    fn a_buffered_request_is_handled_even_when_eof_arrives_first() {
+        let socket = site_socket("buffered-eof");
+        let mut server = Server::bind(&socket, identity(), Duration::from_secs(5)).unwrap();
+        let host_socket = socket.clone();
+        let host = thread::spawn(move || {
+            let mut host = Stream::connect(&host_socket, Duration::from_secs(5)).unwrap();
+            let _hello = host.wait_msg(Duration::from_secs(5)).unwrap();
+            host.send(&HelloOk {
+                protocol: PROTOCOL,
+                capabilities: vec!["notes.open".into()],
+                data_dir: "/data/plugins-data/notes".into(),
+            })
+            .unwrap();
+            host.send(
+                &(Envelope::Request {
+                    request: 23,
+                    op: "notes.open".to_string(),
+                    payload: json!({ "note_id": 19 }),
+                })
+                .to_value(),
+            )
+            .unwrap();
+        });
+
+        let mut session = handshake_session(&mut server);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.stream.poll().expect("收 EOF 前字节不该失败") {
+            assert!(Instant::now() < deadline, "夹具没有及时关线");
+            thread::sleep(Duration::from_millis(2));
+        }
+        host.join().unwrap();
+
+        let mut handled = false;
+        let result = session.pump(&mut |op, payload| {
+            handled = true;
+            assert_eq!(op, "notes.open");
+            assert_eq!(payload["note_id"], json!(19));
+            Dispatch::Done(json!({ "handled": true }))
+        });
+        assert!(handled, "EOF 不能吞掉关线前已经收进缓冲的请求");
+        assert!(
+            matches!(result, Ok(Step::Served { request: 23, .. }) | Err(_)),
+            "请求要么办成，要么因对端已关而回不出答复：{result:?}"
+        );
+        cleanup_site(&socket);
+    }
+
+    /// 第一趟没回话只算通知超时；同一连接上的第二趟仍能正常往返，不能把超时误判成断连。
+    #[test]
+    fn request_timeout_keeps_the_session_usable() {
+        let socket = site_socket("request-timeout");
+        let mut server = Server::bind(&socket, identity(), Duration::from_secs(5)).unwrap();
+        let host_socket = socket.clone();
+        let host = thread::spawn(move || {
+            let mut host = Stream::connect(&host_socket, Duration::from_secs(5)).unwrap();
+            let _hello = host.wait_msg(Duration::from_secs(5)).unwrap();
+            host.send(&HelloOk {
+                protocol: PROTOCOL,
+                capabilities: vec![],
+                data_dir: "/data/plugins-data/notes".into(),
+            })
+            .unwrap();
+            let first = host.wait_msg(Duration::from_secs(5)).unwrap();
+            assert_eq!(first["request"], json!(1));
+            thread::sleep(Duration::from_millis(80));
+            let second = host.wait_msg(Duration::from_secs(5)).unwrap();
+            assert_eq!(second["request"], json!(2));
+            host.send(&(Envelope::Reply {
+                request: 2,
+                payload: json!({ "ok": true }),
+            }).to_value())
+            .unwrap();
+        });
+
+        let mut session = handshake_session(&mut server);
+        let first = session.request(
+            &mut |_op, _payload| Dispatch::Done(json!({})),
+            "host.notes_changed",
+            json!({ "kind": "created" }),
+            Duration::from_millis(30),
+        );
+        assert!(matches!(first, Err(RequestError::TimedOut(_))), "第一趟该只超时：{first:?}");
+        let second = session.request(
+            &mut |_op, _payload| Dispatch::Done(json!({})),
+            "host.notes_changed",
+            json!({ "kind": "renamed" }),
+            Duration::from_secs(2),
+        );
+        assert_eq!(second.unwrap(), HostReply::Done(json!({ "ok": true })));
+        host.join().unwrap();
+        cleanup_site(&socket);
+    }
+
+    /// 宿主读完反向请求就关连接：等待答复时收到 EOF，必须归入连接损坏而不是通知超时。
+    #[test]
+    fn request_reports_peer_eof_as_broken() {
+        let socket = site_socket("request-eof");
+        let mut server = Server::bind(&socket, identity(), Duration::from_secs(5)).unwrap();
+        let host_socket = socket.clone();
+        let host = thread::spawn(move || {
+            let mut host = Stream::connect(&host_socket, Duration::from_secs(5)).unwrap();
+            let _hello = host.wait_msg(Duration::from_secs(5)).unwrap();
+            host.send(&HelloOk {
+                protocol: PROTOCOL,
+                capabilities: vec![],
+                data_dir: "/data/plugins-data/notes".into(),
+            })
+            .unwrap();
+            let _request = host.wait_msg(Duration::from_secs(5)).unwrap();
+        });
+
+        let mut session = handshake_session(&mut server);
+        let result = session.request(
+            &mut |_op, _payload| Dispatch::Done(json!({})),
+            "host.notes_changed",
+            json!({ "kind": "created" }),
+            Duration::from_secs(2),
+        );
+        assert!(matches!(result, Err(RequestError::Broken(_))), "EOF 该判连接坏：{result:?}");
+        host.join().unwrap();
+        cleanup_site(&socket);
+    }
+
+    /// 宿主握手后先关：Windows 管道的首发写就该失败，不能把它误记成「通知超时」。
+    #[cfg(windows)]
+    #[test]
+    fn request_reports_initial_send_failure_as_broken() {
+        let socket = site_socket("request-send-eof");
+        let mut server = Server::bind(&socket, identity(), Duration::from_secs(5)).unwrap();
+        let host_socket = socket.clone();
+        let host = thread::spawn(move || {
+            let mut host = Stream::connect(&host_socket, Duration::from_secs(5)).unwrap();
+            let _hello = host.wait_msg(Duration::from_secs(5)).unwrap();
+            host.send(&HelloOk {
+                protocol: PROTOCOL,
+                capabilities: vec![],
+                data_dir: "/data/plugins-data/notes".into(),
+            })
+            .unwrap();
+        });
+
+        let mut session = handshake_session(&mut server);
+        host.join().unwrap();
+        let result = session.request(
+            &mut |_op, _payload| Dispatch::Done(json!({})),
+            "host.notes_changed",
+            json!({ "kind": "created" }),
+            Duration::from_secs(2),
+        );
+        assert!(matches!(result, Err(RequestError::Broken(_))), "首发失败该判连接坏：{result:?}");
+        cleanup_site(&socket);
+    }
+
+    /// 宿主等插件发出反向请求后，回一条反向请求再关：反向答复写失败也必须判连接坏。
+    #[cfg(windows)]
+    #[test]
+    fn request_reports_reverse_reply_failure_as_broken() {
+        let socket = site_socket("request-reverse-eof");
+        let mut server = Server::bind(&socket, identity(), Duration::from_secs(5)).unwrap();
+        let host_socket = socket.clone();
+        let host = thread::spawn(move || {
+            let mut host = Stream::connect(&host_socket, Duration::from_secs(5)).unwrap();
+            let _hello = host.wait_msg(Duration::from_secs(5)).unwrap();
+            host.send(&HelloOk {
+                protocol: PROTOCOL,
+                capabilities: vec![],
+                data_dir: "/data/plugins-data/notes".into(),
+            })
+            .unwrap();
+            let _request = host.wait_msg(Duration::from_secs(5)).unwrap();
+            host.send(&(Envelope::Request {
+                request: 99,
+                op: "folders.snapshot".to_string(),
+                payload: json!({}),
+            })
+            .to_value())
+            .unwrap();
+        });
+
+        let mut session = handshake_session(&mut server);
+        let mut handled = false;
+        let result = session.request(
+            &mut |_op, _payload| {
+                handled = true;
+                Dispatch::Done(json!({ "ok": true }))
+            },
+            "host.notes_changed",
+            json!({ "kind": "created" }),
+            Duration::from_secs(2),
+        );
+        host.join().unwrap();
+        assert!(handled, "夹具的反向请求要先被办到");
+        assert!(matches!(result, Err(RequestError::Broken(_))), "反向答复失败该判连接坏：{result:?}");
+        cleanup_site(&socket);
+    }
+
+    fn handshake_session(server: &mut Server) -> Session {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(session) = server.accept().unwrap() {
+                return session;
+            }
+            assert!(Instant::now() < deadline, "夹具握手超时");
+            thread::sleep(Duration::from_millis(2));
+        }
     }
 }

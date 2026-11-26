@@ -11,7 +11,7 @@
 //! - [`envelope`]：数据面一帧的codec（请求／成形答复／失败答复三形，P1-a）。
 //! - [`dispatch`]：处理器结果↔线上答复帧、`Step`／`HostReply`（P1-a）。
 //! - [`endpoints`]：读 spawn 那两位 env，判「是不是插件模式」（P1-a）。
-//! - [`transport`]：Unix socket 上的字节管道（`Listener`／`Stream`，P1-c）。
+//! - [`transport`]：Unix socket／Windows named pipe 上的字节管道（`Listener`／`Stream`，P1-c）。
 //! - [`session`]：绑数据面 + 握手 + 逐帧 `pump` + 向宿主 `request`（P1-c）。
 //! - [`storage`]：`notes.db` 与 `folders/<dir>/notes/<id>.md` 那套数据口径（P1-b）。
 //! - [`runtime`]：插件模式那一格的运行——先握手后建窗、一条连接一个泵线程、把 op 结果递给 UI（P1-c）。
