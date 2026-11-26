@@ -221,7 +221,13 @@ pub(crate) enum Triage {
         message: String,
     },
     /// 宿主主动推的一行（`status`／`notes_changed`）：它不是任何请求的答复，不能拿去配对。
-    Announce { event: String },
+    /// `folder`／`kind` 只在变更那一发上有值——宿主把载荷三格与标签同层写，缺位或不是正整数就交
+    /// `None`。`status` 那一发压根不带这两位。
+    Announce {
+        event: String,
+        folder: Option<i64>,
+        kind: Option<String>,
+    },
     Garbage(&'static str),
 }
 
@@ -238,6 +244,8 @@ pub(crate) fn triage(line: &str) -> Triage {
         };
         return Triage::Announce {
             event: event.to_string(),
+            folder: obj.get("folder").and_then(Value::as_i64).filter(|id| *id > 0),
+            kind: obj.get("kind").and_then(Value::as_str).map(str::to_string),
         };
     }
     let Some(request_id) = obj.get("request_id").and_then(Value::as_str) else {
@@ -794,22 +802,54 @@ mod tests {
 
     #[test]
     fn an_event_line_is_never_an_answer() {
-        for line in [
-            r#"{"event":"notes_changed","folder":3,"note_id":9,"kind":"saved"}"#,
-            r#"{"event":"status","plugins":[]}"#,
-        ] {
-            match triage(line) {
-                Triage::Announce { event } => assert!(
-                    event == "notes_changed" || event == "status",
-                    "事件名 {event}"
-                ),
-                other => panic!("事件行被当成了答复：{other:?}"),
+        match triage(r#"{"event":"notes_changed","folder":3,"note_id":9,"kind":"saved"}"#) {
+            Triage::Announce { event, folder, kind } => {
+                assert_eq!(event, "notes_changed");
+                assert_eq!(folder, Some(3));
+                assert_eq!(kind.as_deref(), Some("saved"));
             }
+            other => panic!("变更那一发读成了 {other:?}"),
+        }
+        // status 那一发压根不带这两位：把它们当成"整屏作废"会白重问一遍目录。
+        match triage(r#"{"event":"status","plugins":[]}"#) {
+            Triage::Announce { event, folder, kind } => {
+                assert_eq!(event, "status");
+                assert_eq!(folder, None);
+                assert_eq!(kind, None);
+            }
+            other => panic!("状态那一发读成了 {other:?}"),
         }
         assert_eq!(
             triage(r#"{"event":7,"ok":true,"request_id":"r","payload":{}}"#),
             Triage::Garbage("event 位不是字符串")
         );
+    }
+
+    /// `folder` 只认正整数：宿主对字符串那一位是整条拒收的（`plugins/proxy.rs` 的变更闸），
+    /// 读成 `None` 比猜一枚号安全——猜中的症状是把别家目录那一格作废掉。
+    #[test]
+    fn an_announce_only_believes_a_positive_numeric_folder() {
+        let read = |line: &str| match triage(line) {
+            Triage::Announce { folder, .. } => folder,
+            other => panic!("这一行该是推送：{other:?}"),
+        };
+        for stray in [
+            r#"{"event":"notes_changed"}"#,
+            r#"{"event":"notes_changed","folder":0,"kind":"saved"}"#,
+            r#"{"event":"notes_changed","folder":-3,"kind":"saved"}"#,
+            r#"{"event":"notes_changed","folder":"7","kind":"saved"}"#,
+        ] {
+            assert_eq!(read(stray), None, "{stray} 里那一位不该被当成文件夹");
+        }
+        assert_eq!(
+            read(r#"{"event":"notes_changed","folder":7,"kind":"deleted"}"#),
+            Some(7)
+        );
+        // 种类缺位照样交 None：种类只用来多作废首页那一格，缺它不影响目录。
+        match triage(r#"{"event":"notes_changed","folder":7}"#) {
+            Triage::Announce { kind, .. } => assert_eq!(kind, None),
+            other => panic!("缺种类那一发行读成了 {other:?}"),
+        }
     }
 
     #[test]

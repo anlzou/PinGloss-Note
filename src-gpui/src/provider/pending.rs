@@ -147,7 +147,7 @@ mod tests {
     }
 
     fn open(note_id: i64) -> Command {
-        Command::Open { note_id }
+        Command::Open { note_id, folder_id: 7 }
     }
 
     /// 同一句话问两次也不能共用一个号，否则两趟答复互相顶位，屏上落的是哪一次没人知道。

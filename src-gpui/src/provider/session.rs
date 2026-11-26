@@ -12,9 +12,11 @@ use super::cache::CacheKey;
 pub(crate) const MAX_QUEUED_COMMANDS: usize = 64;
 
 /// 排队等的三条写命令。读不在这里——读只有一趟，见 `ReadTicket`。
+/// ⚠ `Open` 必须带 `folder_id`：宿主对 `notes_open` 是**两位都点名要正整数**，缺任一位整行拒收
+/// （`pg_plugin::control` 的 `allowed`／`positive_id_at`）。只带笔记号的那一形发出去永远没有回执。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
-    Open { note_id: i64 },
+    Open { note_id: i64, folder_id: i64 },
     RemoveRecent { note_id: i64 },
     ClearRecent,
 }
@@ -178,7 +180,7 @@ mod tests {
     }
 
     fn open(note_id: i64) -> Command {
-        Command::Open { note_id }
+        Command::Open { note_id, folder_id: 7 }
     }
 
     /// §3.7.9「每个 provider 同时最多一趟元数据读」：后开的把先开的作废，先开那趟的答复落不得。
@@ -291,6 +293,23 @@ mod tests {
         // 发出去的那一条不算还在队里，用户再点一次还得排得进去。
         assert_eq!(session.next_command(), Some(open(5)));
         assert_eq!(session.enqueue(open(5)), Enqueue::Queued);
+    }
+
+    /// 去重那把尺看的是整条形：同一条笔记挂在两个文件夹下是两条不同的打开，收成一条就会把用户点的
+    /// 那一夹答成别的一夹。
+    #[test]
+    fn the_same_note_in_two_folders_is_not_the_same_command() {
+        let mut session = ProviderSession::new();
+        let first = Command::Open { note_id: 5, folder_id: 7 };
+        let second = Command::Open { note_id: 5, folder_id: 8 };
+        assert_eq!(session.enqueue(first), Enqueue::Queued);
+        assert_eq!(
+            session.enqueue(second),
+            Enqueue::Queued,
+            "换了文件夹的那一次被当成重复丢掉了"
+        );
+        assert_eq!(session.enqueue(first), Enqueue::Duplicate);
+        assert_eq!(session.pending(), 2);
     }
 
     /// 断线那一刻：在飞的读作废、未发出的命令逐条交回，一条都不许静默消失。
