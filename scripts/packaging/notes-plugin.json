@@ -2,7 +2,7 @@
   "id": "notes",
   "display_name": "PinGloss-Note x Nomo",
   "kind": "ui",
-  "version": "0.2.1",
+  "version": "0.3.1",
   "protocol": 1,
   "min_host": "0.9.597",
   "entry": { "path": "bin/PinGloss-Note x Nomo" },
@@ -14,6 +14,7 @@
     { "id": "notes.list", "title": "列出笔记" },
     { "id": "note.new", "title": "新建笔记" },
     { "id": "notes.rename", "title": "重命名笔记" },
+    { "id": "note.delete", "title": "删除笔记" },
     { "id": "notes.info", "title": "问那几篇还在不在" }
   ],
   "license": { "required": false, "trial_days": 0 },

@@ -12,11 +12,11 @@
 # 历史栏／待办／热键的调用方一行不改）；插件模式靠 spawn 那两位 env 判定（见
 # `src-gpui/src/plugin/endpoints.rs`），不是靠 `--mode`，所以清单用 `path` 那一形、不用 `self_mode`。
 #
-# ⚠ **Linux-first**：插件模式的数据面（unix socket）今天只在 Linux/Unix 接线，非 unix 上 `runtime::run`
-#    碰 GPUI 之前就退 2。这一发也照 `package-linux.sh` 钉在 x86_64 Linux。
+# 本脚本只构建 Linux target；插件数据面已按平台分形：Linux/Unix 用 socket，Windows 用 named pipe。
+# Windows 的随包树由 `package-notes-plugin.ps1` 组装，本脚本不跨平台复制产物。
 #
-# 清单那三位与 root Cargo.toml 解耦（重构文档 §5.4 第 2 条）：`version`＝插件包自己的号（0.2.1）、
-# `min_host`＝宿主里能转发全部六条 op（含 `notes.rename`，落地于 v0.9.597）的那一下限。二者都写在
+# 清单那三位与 root Cargo.toml 解耦（重构文档 §5.4 第 2 条）：`version`＝插件包自己的号（0.3.1）、
+# `min_host`＝宿主里能转发全部七条 op（含 `notes.rename`，落地于 v0.9.597）的那一下限。二者都写在
 # `scripts/packaging/notes-plugin.json` 里、由发布人主动改，不随 Nomo 涨版自动动。
 set -euo pipefail
 
@@ -25,7 +25,7 @@ usage() {
 }
 
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || {
-  echo 'Run on x86_64 Linux (P1 的插件数据面只在 unix 接线)。' >&2
+  echo 'Run on x86_64 Linux (this script builds the Linux plugin payload).' >&2
   exit 1
 }
 
@@ -94,8 +94,8 @@ install -m 755 "$binary" "$stage/$plugin_rel/bin/PinGloss-Note x Nomo"
 #    与这一棵树无关，也不许把它塞进那一颗的位置（D-A②／§10 R-1）。
 install -m 644 LICENSE "$stage/$plugin_rel/LICENSE"
 #    ⚠ 随包树这一头发多了三位（`LICENSE`／`licenses/`／`SOURCE.md`），清单那一格没动 ⇒ 真把这棵树发出去
-#    那一发要把 `scripts/packaging/notes-plugin.json` 的 `version` 再抬一格（§5.4 第 2 条：这一位与 Nomo 版本
-#    解耦、由发布人主动改）。联名这一发把包版本从 `0.2.0` 抬到 `0.2.1`，后续发布不得沿用这一位。
+#    那一发要把 `scripts/packaging/notes-plugin.json` 的 `version` 抬一格（§5.4 第 2 条：这一位与 Nomo 版本
+#    解耦、由发布人主动改）。本仓今天还没有对外发过这一棵树，所以这一发没动那位（还是 `0.3.1`）。
 #    组件各自许可那一份照 `package-linux.sh` 的摆法（同名同来源，不在这里另造一套口径）：
 #    桌面包放 `usr/share/doc/nomo/`，插件树里没有 doc 那一层，就放在包自己那一格下面的 `licenses/`。
 mkdir -p "$stage/$plugin_rel/licenses"
@@ -118,7 +118,7 @@ bin_sha="$(sha256sum "$stage/$plugin_rel/bin/PinGloss-Note x Nomo" | cut -c1-64)
 built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # 纸上那句"sha256 与源码一一对应"只在树干净时成立：未提交的改动不进 commit，抄上去就成了假账。
 # `--skip-build` 那一趟更容易碰见（产物是早先那次构建留下的），所以这一位现读、把话头跟着收。
-dirty="$(git -C "$root" status --porcelain --untracked-files=no)"
+dirty="$(git -C "$root" status --porcelain --untracked-files=normal)"
 if [[ -n "$dirty" ]]; then
   n="$(printf '%s\n' "$dirty" | grep -c '')"
   workspace_state="**有 $n 处未提交改动** ⇒ 上面的 commit 记不下这一趟的改动，那一行构建命令照原样重编**不保证**复现出同一个 sha256"
@@ -156,7 +156,7 @@ cat > "$stage/$plugin_rel/SOURCE.md" <<EOF
 
 - 产物由上表那一枚 commit 的源码树构建；**那一下工作区是否干净记在上表「打包那一下的工作区」那一行** ——
   只有那一行写"干净"时，sha256 与 commit 才是一一对应的，重编者照构建命令复现即可自证。
-- "插件模式"那一层（\`src-gpui/src/plugin/\`：数据面 socket、\`notes.db\` 数据层、六条 op 的派发）本来就是
+- "插件模式"那一层（\`src-gpui/src/plugin/\`：数据面 socket、\`notes.db\` 数据层、七条 op 的派发）本来就是
   本仓库源码的一部分，不是外挂补丁；它由宿主通过 \`PINGLOSS_PLUGIN_SOCKET\`／\`PINGLOSS_PLUGIN_DATA\`
   两位环境变量启用，没有那两位就还是桌面那颗 Nomo。
 
@@ -172,10 +172,11 @@ cat > "$stage/$plugin_rel/SOURCE.md" <<EOF
 corresponding source is the repository at the commit above.*
 EOF
 
-# 自证①：清单读得动、十一位必填齐备、三位与发布人应核对的取值一致、六条 op 与运行侧
+# 自证①：清单读得动、十一位必填齐备、三位与发布人应核对的取值一致、七条 op 与运行侧
 # [`plugin::runtime::Engine::handle`] 一字不差（形状闸同宿主 `crates/pg-plugin/src/manifest.rs`）。
-python3 - "$stage/$plugin_rel/plugin.json" <<'PY'
-import json, sys
+python3 - "$stage/$plugin_rel/plugin.json" "$root/src-gpui/src/plugin/runtime.rs" <<'PY'
+import json, re, sys
+from pathlib import Path
 m = json.load(open(sys.argv[1], encoding="utf-8"))
 required = ["id", "kind", "version", "protocol", "min_host", "entry",
             "capabilities", "permissions", "operations", "license", "signature"]
@@ -184,14 +185,30 @@ assert not missing, f"清单缺必填位：{missing}"
 assert m["id"] == "notes", m["id"]
 assert m["kind"] == "ui", m["kind"]
 assert m["protocol"] == 1, m["protocol"]
-assert m["version"] == "0.2.1", m["version"]          # 与 Nomo 版本解耦（§5.4②）
+assert m["version"] == "0.3.1", m["version"]          # 与 Nomo 版本解耦（§5.4②）
 assert m["min_host"] == "0.9.597", m["min_host"]      # 转发 notes.rename 的那一下限
 assert m["entry"] == {"path": "bin/PinGloss-Note x Nomo"}, m["entry"]  # D-D①：联名可执行名
 assert m["signature"] is None, m["signature"]         # 随包内置＝null，由安装包整体校验兜底
 assert m.get("display_name") == "PinGloss-Note x Nomo", m.get("display_name")  # 宿主 0.9.638 起读那位（屏上第一列；没写回 id）
 ops = [o["id"] for o in m["operations"]]
-assert ops == ["folders.snapshot", "notes.open", "notes.list", "note.new", "notes.rename", "notes.info"], ops
-print(f"[清单] plugin.json 十一位齐＋display_name 在场、version={m['version']}、min_host={m['min_host']}、六条 op 与运行侧一致")
+expected = ["folders.snapshot", "notes.open", "notes.list", "note.new", "notes.rename", "note.delete", "notes.info"]
+assert ops == expected, ops
+runtime = Path(sys.argv[2]).read_text(encoding="utf-8")
+# 先圈定 impl Engine，再按 handle 自身缩进取方法体，兼容签名换行与可见性修饰。
+engine = re.search(r"(?ms)^impl Engine \{.*?^\}", runtime)
+assert engine, "runtime.rs 里找不到 impl Engine 的完整落点"
+engine_text = engine.group(0)
+start = re.search(r"(?m)^(?P<indent>[ \t]+)(?:pub(?:\([^)]*\))?\s+)?fn\s+handle\s*\(", engine_text)
+assert start, "runtime.rs 里找不到 Engine::handle 的完整落点"
+body_start = engine_text.find("{", start.end())
+assert body_start >= 0, "Engine::handle 的签名后找不到方法体"
+indent = start.group("indent")
+end = re.search(r"(?m)^" + re.escape(indent) + r"\}[ \t]*\r?$", engine_text[body_start:])
+assert end, "Engine::handle 的方法体没有按自身缩进收口"
+handle = engine_text[start.start():body_start + end.end()]
+for op in expected:
+    assert re.search(r'"' + re.escape(op) + r'"\s*=>', handle), f"runtime handler 缺 {op}"
+print(f"[清单] plugin.json 十一位齐＋display_name 在场、version={m['version']}、min_host={m['min_host']}、七条 op 与 runtime handler 一致")
 PY
 
 # 自证②：那颗产物独立手起 `--probe` 要吐一份自述 JSON、退 0（不碰显示、不碰数据面；口径同 `pingloss-todo`）。
