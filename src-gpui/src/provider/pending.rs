@@ -274,4 +274,11 @@ mod tests {
             assert!(line.contains(&format!("\"request_id\":\"{id}\"")), "{line}");
         }
     }
+
+    /// 两档等待是两个数：宿主打开一篇笔记要做真活，比一次目录读宽一档；写成相等就按翻页的表掐死了打开。
+    #[test]
+    fn the_write_budget_is_wider_than_the_read_one() {
+        assert!(READ_TIMEOUT_MS > 0 && COMMAND_TIMEOUT_MS > READ_TIMEOUT_MS);
+        assert!(COMMAND_TIMEOUT_MS < 60_000, "等到一分钟后才报失败的等待等于没有等待");
+    }
 }
