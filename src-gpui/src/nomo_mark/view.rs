@@ -1453,7 +1453,7 @@ impl NomoMark {
     }
     fn scroll_horizontal(
         &mut self,
-        event: &gpui::ScrollWheelEvent,
+        event: &gpui::ScrollEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2807,7 +2807,7 @@ impl Render for NomoMark {
                 cx.stop_propagation();
             }))
             .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_scroll_wheel(cx.listener(Self::scroll_horizontal))
+            .on_scroll(cx.listener(Self::scroll_horizontal))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .child(ControlElement {

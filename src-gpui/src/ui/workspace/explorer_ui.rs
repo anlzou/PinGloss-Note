@@ -347,7 +347,7 @@ impl Workspace {
                     workspace.open_tree_menu(root, true, true, event.position, cx);
                 }
             }))
-            .on_scroll_wheel(cx.listener(|workspace, _, _, cx| workspace.show_tree_scrollbar(Duration::from_millis(900), cx)))
+            .on_scroll(cx.listener(|workspace, _, _, cx| workspace.show_tree_scrollbar(Duration::from_millis(900), cx)))
             .on_mouse_move(cx.listener(|workspace, event: &gpui::MouseMoveEvent, _, cx| {
                 let bounds = workspace.tree_scroll.0.borrow().base_handle.bounds();
                 if workspace.explorer.scroll_dragging {

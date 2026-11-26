@@ -647,7 +647,7 @@ impl Workspace {
                     }).collect()
                 })
             }).track_scroll(&self.outline_scroll).w_full().h(px(list_height)).pt(px(row_style.list_top_padding()))
-                .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()));
+                .on_scroll(cx.listener(|_, _, _, cx| cx.notify()));
             div().w_full().px(px(row_style.padding)).child(div().relative().w_full().h(px(list_height)).overflow_hidden()
                 .child(list).children(ghosts)).into_any_element()
         };

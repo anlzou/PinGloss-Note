@@ -1158,7 +1158,7 @@ impl NomoMark {
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, cx| { if view.object.as_mut().and_then(|object| object.image_drag.take()).is_some() { cx.notify(); } cx.stop_propagation(); }))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|view, _, _, cx| { if view.object.as_mut().and_then(|object| object.image_drag.take()).is_some() { cx.notify(); } cx.stop_propagation(); }))
-            .on_scroll_wheel(cx.listener(|view, event: &gpui::ScrollEvent, window, cx| {
+            .on_scroll(cx.listener(|view, event: &gpui::ScrollEvent, window, cx| {
                 let delta = event.delta.pixel_delta(px(16.0));
                 if event.modifiers.control || event.modifiers.platform {
                     view.zoom_viewer(if delta.y > px(0.0) { 0.1 } else { -0.1 }, Some(event.position), window, cx);

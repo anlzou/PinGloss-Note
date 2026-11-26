@@ -137,7 +137,7 @@ impl NomoMark {
                 // 外部点击仍交给命中的正文窗口；跨窗口右键可一次关闭旧菜单并打开新菜单。
                 .on_mouse_down(MouseButton::Left, cx.listener(|v, _, w, cx| v.dismiss_context_menu(w, cx)))
                 .on_mouse_down(MouseButton::Right, cx.listener(|v, _, w, cx| v.dismiss_context_menu(w, cx)))
-                .on_scroll_wheel(cx.listener(|v, _, w, cx| v.dismiss_context_menu(w, cx)))
+                .on_scroll(cx.listener(|v, _, w, cx| v.dismiss_context_menu(w, cx)))
         )).with_priority(7);
         // 焦点属于稳定的覆盖层。测量画布中的面板会被移到正文布局之外，不能由它持有键盘分发节点。
         Some(div().id("editor-context-overlay").absolute().inset_0().track_focus(&menu.focus).key_context("EditorContextMenu")
