@@ -6,13 +6,15 @@
 //! 必须在类型上先分开，而不是在每个调用点再判一次 `Option`——漏判的症状是在本地长出一个假标签。
 //!
 //! 本模块只有身份与分流这两件事：控制面的帧形与落点住在 `provider::control`，答复到目录节点的投影
-//! 住在 `provider::node`；有界缓存与在线状态还不在这儿。
+//! 住在 `provider::node`，一屏留多少页住在 `provider::cache`；worker 线程与在线状态还不在这儿。
 use std::path::PathBuf;
 
 #[allow(dead_code)] // 接线之前，端点推导与分诊表只有测试在读。
 pub(crate) mod control;
 #[allow(dead_code)] // 同上：树与首页还没来读投影。
 pub(crate) mod node;
+#[allow(dead_code)] // 同上：还没有读者按这两把尺留页。
+pub(crate) mod cache;
 
 /// `item_id` 的长度上限：它既当缓存键，也要原样进控制帧，超界的那条按坏值拒收而不是截断。
 const MAX_ITEM_BYTES: usize = 512;
