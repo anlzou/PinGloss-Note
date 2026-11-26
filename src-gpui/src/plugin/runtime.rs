@@ -44,6 +44,7 @@ use crate::text_document::markdown_session::{
     MarkdownDocumentSessionManager, RecoveryCandidate, RenameAttemptError, SessionLease,
 };
 use crate::ui::text_field::{FieldEvent, TextField};
+use crate::ui::toolbar_i18n::ToolbarLocale;
 
 /// 宿主数据库里一篇笔记的身份与正文路径。正文由正式会话按需读取。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +81,169 @@ struct LibrarySnapshot {
     notes: Vec<NoteListItem>,
 }
 
+/// 宿主随文件夹快照下发的颜色。插件窗不模拟宿主半透明圆角，只承接颜色与明暗档。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HostSkin {
+    panel_bg: gpui::Hsla,
+    accent: gpui::Hsla,
+    text: gpui::Hsla,
+    hint: gpui::Hsla,
+}
+
+impl HostSkin {
+    fn from_value(value: &Value) -> Option<Self> {
+        Some(Self {
+            panel_bg: host_color(value.get("panel_bg")?)?,
+            accent: host_color(value.get("theme_accent")?)?,
+            text: host_color(value.get("text_color")?)?,
+            hint: host_color(value.get("hint_color")?)?,
+        })
+    }
+
+    fn theme(&self) -> crate::theme::Theme {
+        use crate::theme::Theme;
+        use crate::ui::motion;
+
+        let panel = gpui::Rgba::from(self.panel_bg);
+        let dark = 0.2126 * panel.r + 0.7152 * panel.g + 0.0722 * panel.b < 0.5;
+        let mut theme = if dark { Theme::dark() } else { Theme::light() };
+        let border = motion::color(self.panel_bg, self.text, if dark { 0.22 } else { 0.16 });
+        let hover = motion::color(self.panel_bg, self.text, if dark { 0.09 } else { 0.06 });
+        let surface = motion::color(
+            self.panel_bg,
+            if dark { self.text } else { gpui::white() },
+            if dark { 0.07 } else { 0.35 },
+        );
+        let accent = gpui::Rgba::from(self.accent);
+        let on_accent = if 0.2126 * accent.r + 0.7152 * accent.g + 0.0722 * accent.b > 0.62 {
+            gpui::black()
+        } else {
+            gpui::white()
+        };
+        let accent_strong = motion::color(self.accent, self.text, if dark { 0.28 } else { 0.10 });
+        let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
+        let packed = |color: gpui::Hsla| {
+            let rgba = gpui::Rgba::from(color);
+            (byte(rgba.r) << 16) | (byte(rgba.g) << 8) | byte(rgba.b)
+        };
+
+        theme.id = "pingloss-host".into();
+        theme.dark = dark;
+        theme.document_bg = self.panel_bg;
+        theme.titlebar_bg = surface;
+        theme.titlebar_fg = self.text;
+        theme.titlebar_border = border;
+        theme.accent_fill = self.accent;
+        theme.dropdown_bg = surface;
+        theme.dropdown_border = border;
+        theme.app_bg = self.panel_bg;
+        theme.rail_bg = motion::color(self.panel_bg, self.text, if dark { 0.035 } else { 0.025 });
+        theme.surface = surface;
+        theme.fg = self.text;
+        theme.heading = self.text;
+        theme.muted = self.hint;
+        theme.border = border;
+        theme.workspace_edge = border.opacity(if dark { 0.9 } else { 0.76 });
+        theme.hover = hover;
+        theme.accent = self.accent;
+        theme.accent_strong = accent_strong;
+        theme.on_accent = on_accent;
+        theme.sidebar_active = self.accent.opacity(if dark { 0.18 } else { 0.12 });
+        theme.selection = self.accent.opacity(0.24);
+        theme.caret = self.accent;
+        theme.link = self.accent;
+        theme.quote_border = self.accent.opacity(0.65);
+        theme.quote_fg = self.text;
+        theme.code_bg = hover;
+        theme.code_border = border;
+        theme.code_fg = self.text;
+        theme.inline_code_bg = motion::color(self.panel_bg, self.accent, if dark { 0.14 } else { 0.09 });
+        theme.inline_code_fg = accent_strong;
+        theme.table_border = border;
+        theme.table_header_bg = hover;
+        theme.search_match = self.accent.opacity(0.30);
+        theme.search_current = self.accent.opacity(0.62);
+        theme.marker = self.hint.opacity(0.60);
+        theme.scrollbar = self.hint.opacity(0.72);
+        theme.mermaid = crate::embeds::MermaidPalette {
+            mode: if dark { 1 } else { 0 },
+            colors: [
+                theme.document_bg, theme.surface, theme.fg, theme.border, theme.muted,
+                theme.rail_bg, theme.surface, theme.accent, theme.heading,
+            ].map(packed),
+        };
+        theme
+    }
+}
+
+fn host_color(value: &Value) -> Option<gpui::Hsla> {
+    let raw = value.as_str()?;
+    let hex = raw.strip_prefix('#').unwrap_or(raw);
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok().map(|rgb| gpui::rgb(rgb).into())
+}
+
+fn host_locale(value: &Value) -> Option<&'static str> {
+    let raw = value.as_str()?.trim().replace('_', "-").to_ascii_lowercase();
+    if raw == "zh-hant" || raw == "zh-tw" || raw == "zh-hk" || raw == "zh-mo" {
+        Some("zh-TW")
+    } else if matches!(raw.as_str(), "zh" | "zh-cn" | "zh-hans" | "zh-sg") {
+        Some("zh-CN")
+    } else if raw == "en" || raw.starts_with("en-") {
+        Some("en-US")
+    } else if raw == "ja" || raw.starts_with("ja-") {
+        Some("ja-JP")
+    } else {
+        None
+    }
+}
+
+fn plugin_text(cx: &App, key: &'static str) -> String {
+    ToolbarLocale::current(cx).app_text(key).to_string()
+}
+
+fn plugin_format(cx: &App, key: &'static str, arguments: &[(&str, &str)]) -> String {
+    ToolbarLocale::current(cx).app_format(key, arguments)
+}
+
+#[derive(Clone, Debug)]
+enum StatusMessage {
+    Localized {
+        key: &'static str,
+        arguments: Vec<(String, String)>,
+    },
+    Raw(String),
+}
+
+impl StatusMessage {
+    fn text(key: &'static str) -> Self {
+        Self::Localized { key, arguments: Vec::new() }
+    }
+
+    fn localized(key: &'static str, arguments: &[(&str, &str)]) -> Self {
+        Self::Localized {
+            key,
+            arguments: arguments.iter().map(|(name, value)| ((*name).to_string(), (*value).to_string())).collect(),
+        }
+    }
+
+    fn raw(value: impl Into<String>) -> Self {
+        Self::Raw(value.into())
+    }
+
+    fn render(&self, cx: &App) -> String {
+        match self {
+            Self::Localized { key, arguments } => {
+                let refs: Vec<_> = arguments.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+                plugin_format(cx, key, &refs)
+            }
+            Self::Raw(value) => value.clone(),
+        }
+    }
+}
+
 impl NoteListItem {
     fn to_json(&self, root: &Root) -> Value {
         json!({
@@ -96,7 +260,7 @@ impl NoteListItem {
 }
 
 /// 泵线程递给界面那一格的东西。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UiCommand {
     /// 握手成了：`data_dir` 是宿主在 `HelloOk` 里给的落点，`capabilities` 是它认可的那份清单（原样）。
     Connected {
@@ -105,6 +269,11 @@ pub enum UiCommand {
     },
     /// 收到 `folders.snapshot` ⇒ 界面那一侧的「文件夹 → 笔记」列表要重画。
     FoldersChanged,
+    /// 宿主外观或语言变了；旧宿主不带这两格时不会递这一条。
+    HostAppearanceChanged {
+        skin: Option<HostSkin>,
+        locale: Option<&'static str>,
+    },
     /// `notes.open`／`note.new` 办成：把笔记身份与盘上路径递给正式编辑器。
     OpenNote { note: OpenNote },
     /// 宿主改了当前笔记的物理文件名。
@@ -263,6 +432,11 @@ impl Engine {
                             });
                         }
                     }
+                }
+                let skin = payload.get("ui_skin").and_then(HostSkin::from_value);
+                let locale = payload.get("locale").and_then(host_locale);
+                if skin.is_some() || locale.is_some() {
+                    sink(UiCommand::HostAppearanceChanged { skin, locale });
                 }
                 sink(UiCommand::FoldersChanged);
                 Dispatch::Done(json!({ "ok": true }))
@@ -773,7 +947,7 @@ fn run_plugin(endpoints: Endpoints) {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Nomo · 笔记".into()),
+                        title: Some(plugin_text(cx, "plugin.appTitle").into()),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -882,15 +1056,15 @@ struct PluginWindow {
     library_task: Option<Task<()>>,
     library_generation: u64,
     library_loading: bool,
-    library_error: Option<String>,
+    library_error: Option<StatusMessage>,
     library_scroll: UniformListScrollHandle,
     resolving_open: bool,
     open_request_generation: u64,
     subscription: Option<Subscription>,
     autosave: Option<Task<()>>,
     engine: mpsc::UnboundedSender<EngineCommand>,
-    status: String,
-    failure: Option<String>,
+    status: StatusMessage,
+    failure: Option<StatusMessage>,
     focus: FocusHandle,
     saving: bool,
     waiting_toc: bool,
@@ -914,7 +1088,7 @@ impl PluginWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let search = cx.new(|cx| {
-            let mut field = TextField::new("搜索标题或文件名", cx);
+            let mut field = TextField::new(&plugin_text(cx, "plugin.searchPlaceholder"), cx);
             field.set_settings_style();
             field.set_tab_stop();
             field
@@ -952,7 +1126,7 @@ impl PluginWindow {
             subscription: None,
             autosave: None,
             engine,
-            status: "等待宿主指定笔记…".to_string(),
+            status: StatusMessage::text("plugin.status.waiting"),
             failure: None,
             focus: cx.focus_handle(),
             saving: false,
@@ -989,14 +1163,14 @@ impl PluginWindow {
         let (reply, response) = oneshot::channel();
         if self.engine.send(EngineCommand::Library { folder_id, query, reply }).is_err() {
             self.library_loading = false;
-            self.library_error = Some("宿主数据面已断开，笔记列表暂不可用".to_string());
+            self.library_error = Some(StatusMessage::text("plugin.error.dataDisconnected"));
             cx.notify();
             return;
         }
         cx.spawn(async move |view, cx| {
             let result = match response.await {
-                Ok(result) => result,
-                Err(_) => Err("宿主数据面没有返回笔记列表".to_string()),
+                Ok(result) => result.map_err(StatusMessage::raw),
+                Err(_) => Err(StatusMessage::text("plugin.error.noListReply")),
             };
             let _ = view.update(cx, |view, cx| {
                 if generation != view.library_generation { return; }
@@ -1027,7 +1201,7 @@ impl PluginWindow {
             return;
         }
         if self.notes.iter().any(|note| note.note_id == note_id && note.locked) {
-            self.status = "私有笔记尚未接线".to_string();
+            self.status = StatusMessage::text("plugin.status.privateUnavailable");
             cx.notify();
             return;
         }
@@ -1035,18 +1209,18 @@ impl PluginWindow {
         self.open_request_generation = self.open_request_generation.wrapping_add(1);
         let generation = self.open_request_generation;
         self.failure = None;
-        self.status = "正在确认笔记…".to_string();
+        self.status = StatusMessage::text("plugin.status.confirming");
         let (reply, response) = oneshot::channel();
         if self.engine.send(EngineCommand::OpenLocal { note_id, reply }).is_err() {
             self.resolving_open = false;
-            self.failure = Some("宿主数据面已断开，无法打开笔记".to_string());
+            self.failure = Some(StatusMessage::text("plugin.error.openDisconnected"));
             cx.notify();
             return;
         }
         cx.spawn_in(window, async move |view, cx| {
             let result = match response.await {
-                Ok(result) => result,
-                Err(_) => Err("宿主数据面没有返回打开结果".to_string()),
+                Ok(result) => result.map_err(StatusMessage::raw),
+                Err(_) => Err(StatusMessage::text("plugin.error.noOpenReply")),
             };
             let _ = view.update_in(cx, |view, window, cx| {
                 if generation != view.open_request_generation { return; }
@@ -1060,7 +1234,7 @@ impl PluginWindow {
                     Ok(note) => view.request_open(note, window, cx),
                     Err(error) => {
                         view.failure = Some(error);
-                        view.status = "笔记打开失败".to_string();
+                        view.status = StatusMessage::text("plugin.status.openFailed");
                     }
                 }
                 cx.notify();
@@ -1075,16 +1249,34 @@ impl PluginWindow {
                 data_dir,
                 capabilities,
             } => {
-                self.status = format!(
-                    "已连上宿主 · 数据目录 {data_dir} · 认可能力 {} 条",
-                    capabilities.len()
+                self.status = StatusMessage::localized(
+                    "plugin.status.connected",
+                    &[("data_dir", &data_dir), ("count", &capabilities.len().to_string())],
                 );
             }
             UiCommand::FoldersChanged => {
                 if self.document.is_none() {
-                    self.status = "目录快照已更新，可从左侧选择笔记".to_string();
+                    self.status = StatusMessage::text("plugin.status.snapshotReady");
                 }
                 self.schedule_library_refresh(cx);
+            }
+            UiCommand::HostAppearanceChanged { skin, locale } => {
+                if let Some(skin) = skin {
+                    let theme = skin.theme();
+                    crate::layout::bump_generation();
+                    cx.set_global(theme);
+                }
+                if let Some(locale) = locale {
+                    crate::settings::Settings::set_with(
+                        cx,
+                        "interfaceLanguage",
+                        json!(locale),
+                        false,
+                    );
+                    let placeholder = plugin_text(cx, "plugin.searchPlaceholder");
+                    self.search.update(cx, |field, cx| field.set_placeholder(&placeholder, cx));
+                }
+                self.update_title(window, cx);
             }
             UiCommand::OpenNote { note } => self.request_open(note, window, cx),
             UiCommand::NoteRenamed { note_id, path } => {
@@ -1107,13 +1299,13 @@ impl PluginWindow {
                     if let Some(document) = self.document.clone() {
                         document.update(cx, |host, cx| host.refresh_renamed_path(cx));
                     }
-                    self.status = "笔记文件名已更新".to_string();
-                    self.update_title(window);
+                    self.status = StatusMessage::text("plugin.status.renamed");
+                    self.update_title(window, cx);
                     self.schedule_library_refresh(cx);
                 }
             }
-            UiCommand::Notice(message) => self.status = message,
-            UiCommand::OpenBlank => self.status = "宿主还没有指定具体笔记".to_string(),
+            UiCommand::Notice(message) => self.status = StatusMessage::raw(message),
+            UiCommand::OpenBlank => self.status = StatusMessage::text("plugin.status.noNote"),
         }
         cx.notify();
     }
@@ -1202,7 +1394,10 @@ impl PluginWindow {
         self.opening = true;
         self.opening_note = Some(note.clone());
         self.failure = None;
-        self.status = format!("正在打开 {}…", file_name(&note.path));
+        self.status = StatusMessage::localized(
+            "plugin.status.opening",
+            &[("name", &file_name(&note.path))],
+        );
         self.dismiss_after_open = dismiss_after_open;
         let manager = self.manager.clone();
         let note_for_open = note.clone();
@@ -1348,8 +1543,8 @@ impl PluginWindow {
         self.note = Some(note);
         self.document = Some(document.clone());
         self.failure = None;
-        self.status = "笔记已打开".to_string();
-        self.update_title(window);
+        self.status = StatusMessage::text("plugin.status.opened");
+        self.update_title(window, cx);
         self.schedule_library_refresh(cx);
         window.focus(&document.focus_handle(cx), cx);
         if let Some(candidate) = self.dismiss_after_open.take() {
@@ -1373,12 +1568,16 @@ impl PluginWindow {
         let label = pending.candidate.label();
         let response = window.prompt(
             PromptLevel::Warning,
-            "发现未保存草稿",
-            Some(&format!("{label}\n可以恢复会话草稿，也可以使用磁盘上的正文。")),
+            &plugin_text(cx, "plugin.recovery.title"),
+            Some(&plugin_format(
+                cx,
+                "plugin.recovery.body",
+                &[("label", &label)],
+            )),
             &[
-                PromptButton::new("恢复草稿"),
-                PromptButton::new("使用磁盘正文"),
-                PromptButton::cancel("取消"),
+                PromptButton::new(plugin_text(cx, "plugin.recovery.restore")),
+                PromptButton::new(plugin_text(cx, "plugin.recovery.disk")),
+                PromptButton::cancel(plugin_text(cx, "plugin.recovery.cancel")),
             ],
             cx,
         );
@@ -1390,7 +1589,7 @@ impl PluginWindow {
                     Ok(0) => view.recover_note(pending.note, pending.candidate, window, cx),
                     Ok(1) => view.begin_open(pending.note, false, Some(pending.candidate), window, cx),
                     _ => {
-                        view.status = "已保留恢复草稿".to_string();
+                        view.status = StatusMessage::text("plugin.status.recoveryKept");
                         if let Some(note) = view.pending_open.take() {
                             view.request_open(note, window, cx);
                         }
@@ -1418,7 +1617,7 @@ impl PluginWindow {
         self.open_cancel = Some(cancel.clone());
         self.opening = true;
         self.opening_note = Some(note.clone());
-        self.status = "正在恢复草稿…".to_string();
+        self.status = StatusMessage::text("plugin.status.restoring");
         let manager = self.manager.clone();
         let owner = format!("pingloss-notes-{}", note.note_id);
         let task = cx.background_executor().spawn(async move {
@@ -1446,8 +1645,8 @@ impl PluginWindow {
         self.opening = false;
         self.opening_note = None;
         self.dismiss_after_open = None;
-        self.failure = Some(error);
-        self.status = "笔记打开失败".to_string();
+        self.failure = Some(StatusMessage::raw(error));
+        self.status = StatusMessage::text("plugin.status.openFailed");
         cx.notify();
     }
 
@@ -1463,11 +1662,14 @@ impl PluginWindow {
         }
         match event {
             DocumentEvent::Changed => self.schedule_autosave(document.clone(), window, cx),
-            DocumentEvent::Failure(message) => self.failure = Some(message.clone()),
-            DocumentEvent::Notice(message) => self.status = message.clone(),
+            DocumentEvent::Failure(message) => self.failure = Some(StatusMessage::raw(message.clone())),
+            DocumentEvent::Notice(message) => self.status = StatusMessage::raw(message.clone()),
             DocumentEvent::TocSettled(warning) => {
                 if let Some(warning) = warning {
-                    self.status = format!("目录检查提示：{warning}");
+                    self.status = StatusMessage::localized(
+                        "plugin.status.tocWarning",
+                        &[("warning", warning)],
+                    );
                 }
                 if self.waiting_toc {
                     self.waiting_toc = false;
@@ -1475,9 +1677,12 @@ impl PluginWindow {
                     self.save(after, window, cx);
                 }
             }
-            DocumentEvent::Saved => self.status = "笔记已保存".to_string(),
+            DocumentEvent::Saved => self.status = StatusMessage::text("plugin.status.saved"),
             DocumentEvent::OpenMarkdownLink { path, .. } => {
-                self.status = format!("插件暂不支持从正文打开其他笔记：{}", path.display());
+                self.status = StatusMessage::localized(
+                    "plugin.status.openFromBodyUnsupported",
+                    &[("path", &path.display().to_string())],
+                );
             }
             DocumentEvent::FileStateChanged
             | DocumentEvent::Status
@@ -1545,7 +1750,7 @@ impl PluginWindow {
         self.failure = None;
         if document.read(cx).has_composition(cx) {
             self.schedule_autosave(document, window, cx);
-            self.status = "等待输入法收尾后保存…".to_string();
+            self.status = StatusMessage::text("plugin.status.waitingComposition");
             cx.notify();
             return;
         }
@@ -1553,7 +1758,7 @@ impl PluginWindow {
             Ok(true) => {}
             Ok(false) => {
                 self.schedule_autosave(document, window, cx);
-                self.status = "等待编辑控件收尾后保存…".to_string();
+                self.status = StatusMessage::text("plugin.status.waitingEditor");
                 cx.notify();
                 return;
             }
@@ -1568,7 +1773,7 @@ impl PluginWindow {
         }
         if !document.update(cx, |host, cx| host.toc_ready_for_save(cx)) {
             self.waiting_toc = true;
-            self.status = "等待目录检查完成后保存…".to_string();
+            self.status = StatusMessage::text("plugin.status.waitingToc");
             cx.notify();
             return;
         }
@@ -1583,7 +1788,7 @@ impl PluginWindow {
         cx: &mut Context<Self>,
     ) {
         self.saving = true;
-        self.status = "正在确认笔记归属…".to_string();
+        self.status = StatusMessage::text("plugin.status.confirmingOwnership");
         let (reply, response) = oneshot::channel();
         if self.engine.send(EngineCommand::PrepareSave {
             note_id: note.note_id,
@@ -1623,7 +1828,7 @@ impl PluginWindow {
         if !document.update(cx, |host, cx| host.toc_ready_for_save(cx)) {
             self.saving = false;
             self.waiting_toc = true;
-            self.status = "等待目录检查完成后保存…".to_string();
+            self.status = StatusMessage::text("plugin.status.waitingToc");
             cx.notify();
             return;
         }
@@ -1634,7 +1839,7 @@ impl PluginWindow {
                 return;
             }
         };
-        self.status = "正在保存正文…".to_string();
+        self.status = StatusMessage::text("plugin.status.savingBody");
         let task = cx.background_executor().spawn(async move {
             // 让会话在路径锁内解析当前文件名，避免保存与宿主重命名交错时写回旧路径。
             port.save_captured(captured, None, false)
@@ -1673,7 +1878,7 @@ impl PluginWindow {
         cx: &mut Context<Self>,
     ) {
         self.saving = true;
-        self.status = "正在更新宿主笔记索引…".to_string();
+        self.status = StatusMessage::text("plugin.status.updatingIndex");
         let (reply, response) = oneshot::channel();
         if self.engine.send(EngineCommand::SaveFinished {
             note_id: note.note_id,
@@ -1700,8 +1905,8 @@ impl PluginWindow {
                         view.index_pending = None;
                         view.saving = false;
                         view.failure = None;
-                        view.status = "笔记已保存".to_string();
-                        view.update_title(window);
+                        view.status = StatusMessage::text("plugin.status.saved");
+                        view.update_title(window, cx);
                         view.schedule_library_refresh(cx);
                         let after = view.close_intent.take_after_save();
                         view.complete_after_save(after, window, cx);
@@ -1722,8 +1927,8 @@ impl PluginWindow {
         self.saving = false;
         self.waiting_toc = false;
         self.close_intent.cancel();
-        self.failure = Some(error);
-        self.status = "保存未完成".to_string();
+        self.failure = Some(StatusMessage::raw(error));
+        self.status = StatusMessage::text("plugin.status.saveFailed");
         cx.notify();
     }
 
@@ -1757,8 +1962,8 @@ impl PluginWindow {
             document.update(cx, |host, cx| host.close_document(discard, cx))
         }).transpose().map(|_| ());
         if let Err(error) = &result {
-            self.failure = Some(error.to_string());
-            self.status = "笔记关闭未完成".to_string();
+            self.failure = Some(StatusMessage::raw(error.to_string()));
+            self.status = StatusMessage::text("plugin.status.closeFailed");
             cx.notify();
             return result;
         }
@@ -1769,13 +1974,13 @@ impl PluginWindow {
         self.index_pending = None;
         self.resolving_open = false;
         self.open_request_generation = self.open_request_generation.wrapping_add(1);
-        self.status = "从左侧选择笔记，或等待宿主指定".to_string();
+        self.status = StatusMessage::text("plugin.status.chooseNote");
         Ok(())
     }
 
-    fn update_title(&self, window: &mut Window) {
+    fn update_title(&self, window: &mut Window, cx: &App) {
         let title = self.note.as_ref().map(|note| file_name(&note.path))
-            .unwrap_or_else(|| "Nomo · 笔记".to_string());
+            .unwrap_or_else(|| plugin_text(cx, "plugin.appTitle"));
         window.set_window_title(&format!("{title} — Nomo"));
     }
 
@@ -1879,9 +2084,15 @@ impl Render for PluginWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.global::<crate::theme::Theme>().clone();
         let title = self.note.as_ref().map(|note| file_name(&note.path))
-            .unwrap_or_else(|| "Nomo · 笔记".to_string());
+            .unwrap_or_else(|| plugin_text(cx, "plugin.appTitle"));
         let dirty = self.document.as_ref().is_some_and(|document| document.read(cx).is_dirty(cx));
-        let save_label = if self.saving { "保存中…" } else if dirty { "保存" } else { "已保存" };
+        let save_label = if self.saving {
+            plugin_text(cx, "plugin.save.saving")
+        } else if dirty {
+            plugin_text(cx, "plugin.save.dirty")
+        } else {
+            plugin_text(cx, "plugin.save.saved")
+        };
         let save_kind = if self.saving {
             crate::ui::components::ButtonKind::Disabled
         } else {
@@ -1892,7 +2103,7 @@ impl Render for PluginWindow {
             .flex().items_center().gap(px(8.0)).rounded(px(6.0)).cursor_pointer()
             .text_size(px(13.0)).text_color(theme.fg)
             .child(crate::ui::components::icon(crate::ui::components::IconName::BookOpenText, 15.0, theme.muted))
-            .child("全部笔记")
+            .child(plugin_text(cx, "plugin.library.allNotes"))
             .on_click(cx.listener(|view, _, _, cx| {
                 view.selected_folder = None;
                 view.schedule_library_refresh(cx);
@@ -1918,7 +2129,7 @@ impl Render for PluginWindow {
                 .child(div().flex_1().min_w_0().truncate().child(folder.name.clone()))
                 .on_click(cx.listener(move |view, _, _, cx| {
                     if view.folders.iter().find(|entry| entry.id == folder_id).is_some_and(|entry| entry.locked) {
-                        view.status = "锁定文件夹尚未接线".to_string();
+                        view.status = StatusMessage::text("plugin.status.lockedFolderUnavailable");
                         cx.notify();
                         return;
                     }
@@ -1966,17 +2177,22 @@ impl Render for PluginWindow {
         }));
         let empty_notes = (note_count == 0).then(|| {
             div().h(px(72.0)).px(px(14.0)).flex().items_center().text_size(px(12.0))
-                .text_color(theme.muted).child(if self.library_loading { "正在读取笔记…" } else { "这里还没有笔记" })
+                .text_color(theme.muted).child(if self.library_loading {
+                    plugin_text(cx, "plugin.library.loading")
+                } else {
+                    plugin_text(cx, "plugin.library.empty")
+                })
         });
         let library_status = self.library_error.as_ref().map(|message| {
             div().flex_none().px_3().py_2().text_size(px(11.0)).text_color(theme.danger)
-                .whitespace_normal().child(message.clone())
+                .whitespace_normal().child(message.render(cx))
         });
         let sidebar = div().w(px(248.0)).flex_none().flex().flex_col().min_h_0()
             .bg(theme.rail_bg).border_r_1().border_color(theme.border)
             .child(div().h(px(40.0)).flex_none().px_4().flex().items_center().justify_between()
                 .text_size(px(13.0)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme.fg)
-                .child("笔记").child(if self.library_loading { "刷新中…" } else { "" }))
+                .child(plugin_text(cx, "plugin.library.notes"))
+                .child(if self.library_loading { plugin_text(cx, "plugin.library.refreshing") } else { String::new() }))
             .child(div().h(px(34.0)).mx_3().mb_2().px_2().flex_none().flex().items_center().gap_2()
                 .rounded(px(6.0)).bg(theme.surface).border_1().border_color(theme.border)
                 .child(crate::ui::components::icon(crate::ui::components::IconName::Search, 14.0, theme.muted))
@@ -1985,19 +2201,20 @@ impl Render for PluginWindow {
                 .overflow_y_scroll().py_1().children(folder_rows))
             .child(div().h(px(1.0)).flex_none().bg(theme.border))
             .child(div().h(px(34.0)).flex_none().px_4().flex().items_center().text_size(px(11.0))
-                .font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme.muted).child("笔记列表"))
+                .font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme.muted)
+                .child(plugin_text(cx, "plugin.library.noteList")))
             .child(div().flex_1().min_h_0().overflow_hidden().child(note_list).children(empty_notes))
             .children(library_status);
 
         let body = div().flex_1().min_h_0().min_w_0().flex().flex_col().children(self.document.clone());
         let empty = self.document.is_none().then(|| {
             div().flex_1().size_full().flex().items_center().justify_center().text_color(theme.muted)
-                .child(self.status.clone())
+                .child(self.status.render(cx))
         });
         let error = self.failure.as_ref().map(|message| {
             div().w_full().flex_none().px_4().py_2().border_t_1().border_color(theme.border)
                 .text_size(px(12.0)).text_color(theme.danger).whitespace_normal()
-                .child(message.clone())
+                .child(message.render(cx))
         });
         div()
             .size_full()
@@ -2161,6 +2378,177 @@ mod tests {
             folders: Vec::new(),
             pending_change: None,
             sessions: None,
+        }
+    }
+
+    fn appearance_payload(root: &Path) -> Value {
+        json!({
+            "root": root.to_string_lossy(),
+            "folders": [{ "id": 7, "name": "收件箱", "dir_name": "inbox" }],
+            "ui_skin": {
+                "panel_bg": "#f4f1ea",
+                "panel_opacity": 0.8,
+                "panel_font_scale": 1.0,
+                "theme_accent": "#c25436",
+                "text_color": "#24211d",
+                "hint_color": "#746e65"
+            },
+            "locale": "zh_Hant"
+        })
+    }
+
+    #[test]
+    fn host_snapshot_emits_appearance_before_the_folder_refresh() {
+        let data = tempfile::Builder::new().prefix("nomo-rt-skin-db").tempdir().unwrap();
+        let root = tempfile::Builder::new().prefix("nomo-rt-skin-root").tempdir().unwrap();
+        let mut engine = engine(&data.path().join("notes.db"));
+        let mut seen = Vec::new();
+
+        let done = engine.handle("folders.snapshot", appearance_payload(root.path()), &mut |command| seen.push(command));
+
+        assert_eq!(done, Dispatch::Done(json!({ "ok": true })));
+        assert_eq!(seen.len(), 2, "外观与目录刷新是两格，不能互相顶掉：{seen:?}");
+        let UiCommand::HostAppearanceChanged { skin, locale } = &seen[0] else {
+            panic!("第一格该是宿主外观：{seen:?}");
+        };
+        assert_eq!(*locale, Some("zh-TW"));
+        let skin = skin.as_ref().expect("完整 ui_skin 该被接住");
+        assert_eq!(skin.panel_bg, gpui::rgb(0xf4f1ea).into());
+        assert_eq!(skin.accent, gpui::rgb(0xc25436).into());
+        assert_eq!(skin.text, gpui::rgb(0x24211d).into());
+        assert_eq!(skin.hint, gpui::rgb(0x746e65).into());
+        assert_eq!(seen[1], UiCommand::FoldersChanged);
+
+        let theme = skin.theme();
+        assert_eq!(theme.id, "pingloss-host");
+        assert!(!theme.dark, "浅色宿主背景该落到亮色基础主题");
+        assert_eq!(theme.document_bg, skin.panel_bg);
+        assert_eq!(theme.fg, skin.text);
+        assert_eq!(theme.muted, skin.hint);
+        assert_eq!(theme.accent, skin.accent);
+        assert_eq!(theme.mermaid.mode, 0);
+        assert_eq!(theme.mermaid.colors[0], 0xf4f1ea, "Mermaid 背景必须取叠加后的宿主色");
+        assert_eq!(theme.mermaid.colors[7], 0xc25436, "Mermaid 强调色必须取宿主色");
+        assert_eq!(theme.code_function, crate::theme::Theme::light().code_function, "语法高亮仍沿用基础主题");
+    }
+
+    #[test]
+    fn dark_host_skin_keeps_mermaid_and_contrast_in_the_same_palette() {
+        let skin = HostSkin::from_value(&json!({
+            "panel_bg": "171b21",
+            "theme_accent": "7bd6c2",
+            "text_color": "f1eee8",
+            "hint_color": "a39d94"
+        })).unwrap();
+        let theme = skin.theme();
+
+        assert!(theme.dark);
+        assert_eq!(theme.document_bg, gpui::rgb(0x171b21).into());
+        assert_eq!(theme.mermaid.mode, 1);
+        assert_eq!(theme.mermaid.colors[0], 0x171b21);
+        assert_eq!(theme.mermaid.colors[2], 0xf1eee8);
+        assert_eq!(theme.on_accent, gpui::black().into(), "明亮强调色上用黑字");
+    }
+
+    #[test]
+    fn incomplete_or_legacy_appearance_does_not_break_folder_snapshots() {
+        let data = tempfile::Builder::new().prefix("nomo-rt-skin-fallback-db").tempdir().unwrap();
+        let root = tempfile::Builder::new().prefix("nomo-rt-skin-fallback-root").tempdir().unwrap();
+        let mut engine = engine(&data.path().join("notes.db"));
+        let mut seen = Vec::new();
+        let done = engine.handle(
+            "folders.snapshot",
+            json!({
+                "root": root.path().to_string_lossy(),
+                "ui_skin": { "panel_bg": "#ffffff", "theme_accent": "bad" },
+                "locale": "en_US"
+            }),
+            &mut |command| seen.push(command),
+        );
+        assert_eq!(done, Dispatch::Done(json!({ "ok": true })));
+        assert_eq!(seen, vec![
+            UiCommand::HostAppearanceChanged { skin: None, locale: Some("en-US") },
+            UiCommand::FoldersChanged,
+        ], "坏皮肤不能拖住同一条快照里的好语言");
+
+        seen.clear();
+        let mut skin_only = appearance_payload(root.path());
+        skin_only.as_object_mut().unwrap().remove("locale");
+        engine.handle("folders.snapshot", skin_only, &mut |command| seen.push(command));
+        assert_eq!(seen.len(), 2, "只有皮肤时也要先应用外观再刷目录");
+        let UiCommand::HostAppearanceChanged { skin, locale } = &seen[0] else {
+            panic!("只有皮肤时第一格仍是宿主外观：{seen:?}");
+        };
+        assert!(skin.is_some(), "完整皮肤不能因为没有 locale 被丢掉");
+        assert_eq!(*locale, None);
+        assert_eq!(seen[1], UiCommand::FoldersChanged);
+
+        seen.clear();
+        engine.handle(
+            "folders.snapshot",
+            json!({ "root": root.path().to_string_lossy(), "ui_skin": null, "locale": "unknown" }),
+            &mut |command| seen.push(command),
+        );
+        assert_eq!(seen, vec![UiCommand::FoldersChanged], "旧宿主与坏外观都该只刷新目录");
+    }
+
+    #[test]
+    fn host_colors_require_six_hex_digits() {
+        for value in [json!("#fff"), json!("#ffffffff"), json!("#gg0000"), json!(123456), Value::Null] {
+            assert!(host_color(&value).is_none(), "不该接受 {value}");
+        }
+        assert_eq!(host_color(&json!("F4F1EA")), Some(gpui::rgb(0xf4f1ea).into()));
+        assert_eq!(host_color(&json!("#c25436")), Some(gpui::rgb(0xc25436).into()));
+    }
+
+    #[test]
+    fn host_skin_rejects_each_missing_color() {
+        let root = tempfile::Builder::new().prefix("nomo-rt-skin-fields-root").tempdir().unwrap();
+        let full = appearance_payload(root.path());
+        for field in ["panel_bg", "theme_accent", "text_color", "hint_color"] {
+            let mut payload = full.clone();
+            payload["ui_skin"].as_object_mut().unwrap().remove(field);
+            assert!(HostSkin::from_value(payload.get("ui_skin").unwrap()).is_none(), "缺 {field} 时不能拼一只半截皮肤");
+        }
+    }
+
+    #[test]
+    fn host_locales_normalize_to_the_four_supported_ids() {
+        for (input, expected) in [
+            ("zh", "zh-CN"), ("zh_CN", "zh-CN"), ("zh-Hans", "zh-CN"),
+            ("zh-Hant", "zh-TW"), ("zh_TW", "zh-TW"), ("zh-HK", "zh-TW"), ("zh-MO", "zh-TW"),
+            ("en", "en-US"), ("en_US", "en-US"), ("ja", "ja-JP"), ("ja_JP", "ja-JP"),
+        ] {
+            assert_eq!(host_locale(&json!(input)), Some(expected), "{input}");
+        }
+        for input in ["", "fr-FR", "zh-CN-extra", "de"] {
+            assert_eq!(host_locale(&json!(input)), None, "{input}");
+        }
+        assert_eq!(host_locale(&json!(42)), None);
+    }
+
+    #[test]
+    fn every_plugin_translation_has_all_languages_and_matching_placeholders() {
+        let source = include_str!("runtime.rs");
+        let source = source.split_once("#[cfg(test)]").expect("测试段标记").0;
+        let keys: std::collections::BTreeSet<_> = source.match_indices("\"plugin.").filter_map(|(at, _)| {
+            let rest = &source[at + 1..];
+            Some(rest[..rest.find('"')?].to_string())
+        }).collect();
+        assert!(keys.len() >= 40, "插件文案键少得反常：{keys:?}");
+        let values: Value = serde_json::from_str(include_str!("../../resources/app-locales.json")).unwrap();
+        let placeholders = |text: &str| {
+            let mut names: Vec<_> = text.split('{').skip(1).filter_map(|part| part.split_once('}').map(|(name, _)| name.to_string())).collect();
+            names.sort();
+            names
+        };
+        for locale in ["zh-CN", "zh-TW", "en-US", "ja-JP"] {
+            let table = &values[locale];
+            for key in &keys {
+                let text = table[key].as_str().unwrap_or_else(|| panic!("{locale} 缺 {key}"));
+                assert!(!text.trim().is_empty(), "{locale} 的 {key} 是空串");
+                assert_eq!(placeholders(text), placeholders(values["zh-CN"][key].as_str().unwrap()), "{locale} 的 {key} 占位符漂了");
+            }
         }
     }
 
