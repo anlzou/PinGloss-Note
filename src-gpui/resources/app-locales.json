@@ -844,7 +844,19 @@
     "plugin.library.empty": "这里还没有笔记",
     "plugin.save.saving": "保存中…",
     "plugin.save.dirty": "保存",
-    "plugin.save.saved": "已保存"
+    "plugin.save.saved": "已保存",
+    "plugin.delete.label": "删除",
+    "plugin.delete.title": "删除笔记？",
+    "plugin.delete.body": "删除「{name}」后无法恢复，正文和附件会一并删除。",
+    "plugin.delete.confirm": "删除",
+    "plugin.delete.cancel": "取消",
+    "plugin.status.deleting": "正在删除笔记…",
+    "plugin.status.deleted": "笔记已删除",
+    "plugin.status.deletedWithWarning": "笔记已删除，但部分文件清理失败：{warning}",
+    "plugin.status.deleteFailed": "笔记删除失败",
+    "plugin.status.deleteMissing": "笔记已不存在",
+    "plugin.error.noDeleteReply": "宿主数据面没有返回删除结果",
+    "plugin.error.deleteDisconnected": "宿主数据面已断开，无法删除笔记"
   },
   "zh-TW": {
     "settings.category.shortcuts": "快捷鍵",
@@ -1691,7 +1703,19 @@
     "plugin.library.empty": "這裡還沒有筆記",
     "plugin.save.saving": "儲存中…",
     "plugin.save.dirty": "儲存",
-    "plugin.save.saved": "已儲存"
+    "plugin.save.saved": "已儲存",
+    "plugin.delete.label": "刪除",
+    "plugin.delete.title": "刪除筆記？",
+    "plugin.delete.body": "刪除「{name}」後無法復原，正文和附件會一併刪除。",
+    "plugin.delete.confirm": "刪除",
+    "plugin.delete.cancel": "取消",
+    "plugin.status.deleting": "正在刪除筆記…",
+    "plugin.status.deleted": "筆記已刪除",
+    "plugin.status.deletedWithWarning": "筆記已刪除，但部分檔案清理失敗：{warning}",
+    "plugin.status.deleteFailed": "筆記刪除失敗",
+    "plugin.status.deleteMissing": "筆記已不存在",
+    "plugin.error.noDeleteReply": "宿主資料面沒有回傳刪除結果",
+    "plugin.error.deleteDisconnected": "宿主資料面已中斷，無法刪除筆記"
   },
   "en-US": {
     "settings.category.shortcuts": "Keyboard shortcuts",
@@ -2538,7 +2562,19 @@
     "plugin.library.empty": "No notes here yet",
     "plugin.save.saving": "Saving…",
     "plugin.save.dirty": "Save",
-    "plugin.save.saved": "Saved"
+    "plugin.save.saved": "Saved",
+    "plugin.delete.label": "Delete",
+    "plugin.delete.title": "Delete note?",
+    "plugin.delete.body": "Deleting “{name}” cannot be undone. Its body and attachments will also be deleted.",
+    "plugin.delete.confirm": "Delete",
+    "plugin.delete.cancel": "Cancel",
+    "plugin.status.deleting": "Deleting note…",
+    "plugin.status.deleted": "Note deleted",
+    "plugin.status.deletedWithWarning": "Note deleted, but some files could not be removed: {warning}",
+    "plugin.status.deleteFailed": "Could not delete the note",
+    "plugin.status.deleteMissing": "The note no longer exists",
+    "plugin.error.noDeleteReply": "The host data connection did not return a delete result",
+    "plugin.error.deleteDisconnected": "The host data connection closed; the note cannot be deleted"
   },
   "ja-JP": {
     "settings.category.shortcuts": "キーボードショートカット",
@@ -3385,6 +3421,18 @@
     "plugin.library.empty": "まだノートがありません",
     "plugin.save.saving": "保存中…",
     "plugin.save.dirty": "保存",
-    "plugin.save.saved": "保存済み"
+    "plugin.save.saved": "保存済み",
+    "plugin.delete.label": "削除",
+    "plugin.delete.title": "ノートを削除しますか？",
+    "plugin.delete.body": "「{name}」を削除すると元に戻せません。本文と添付ファイルも削除されます。",
+    "plugin.delete.confirm": "削除",
+    "plugin.delete.cancel": "キャンセル",
+    "plugin.status.deleting": "ノートを削除しています…",
+    "plugin.status.deleted": "ノートを削除しました",
+    "plugin.status.deletedWithWarning": "ノートを削除しましたが、一部のファイルを削除できませんでした：{warning}",
+    "plugin.status.deleteFailed": "ノートを削除できませんでした",
+    "plugin.status.deleteMissing": "ノートはすでに存在しません",
+    "plugin.error.noDeleteReply": "ホストとのデータ接続から削除結果が返りませんでした",
+    "plugin.error.deleteDisconnected": "ホストとのデータ接続が切れたため、ノートを削除できません"
   }
 }

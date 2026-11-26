@@ -12,7 +12,7 @@
 //! 自有的库与恢复快照（D-B①）。`notes.db` 建在宿主给的 `data_dir` 那一层，正文根 `folders/` 从 `folders.snapshot`
 //! 里绑——真源是宿主的，不是 Nomo 的（[`crate::plugin::storage`] 头上那条 ⚠）。
 //!
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{Duration, Instant};
@@ -79,6 +79,12 @@ struct NoteListItem {
 struct LibrarySnapshot {
     folders: Vec<FolderInfo>,
     notes: Vec<NoteListItem>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DeleteOutcome {
+    deleted: bool,
+    warnings: Vec<String>,
 }
 
 /// 宿主随文件夹快照下发的颜色。插件窗不模拟宿主半透明圆角，只承接颜色与明暗档。
@@ -278,6 +284,8 @@ pub enum UiCommand {
     OpenNote { note: OpenNote },
     /// 宿主改了当前笔记的物理文件名。
     NoteRenamed { note_id: i64, path: PathBuf },
+    /// 一篇笔记已从宿主数据库与磁盘删除。
+    NoteDeleted { note_id: i64 },
     /// 数据面或会话给出的非阻断提示。
     Notice(String),
     /// `notes.open` 没点到具体号、且那目录里空空如也 ⇒ 留给宿主继续指定笔记。
@@ -303,6 +311,13 @@ enum EngineCommand {
         note_id: i64,
         path: PathBuf,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    NoteClosed {
+        note_id: i64,
+    },
+    DeleteLocal {
+        note_id: i64,
+        reply: oneshot::Sender<Result<DeleteOutcome, String>>,
     },
 }
 
@@ -375,6 +390,8 @@ struct Engine {
     root_path: Option<PathBuf>,
     /// 每篇已打开笔记绑定的正文根，保存时按笔记身份取用。
     note_roots: HashMap<i64, PathBuf>,
+    /// 已交给编辑器的笔记；删除请求遇到在飞会话时拒绝，避免正文被重新写回。
+    open_notes: HashSet<i64>,
     /// `folders.snapshot` 里那排文件夹；保留宿主顺序，列表按原顺序展示。
     folders: Vec<FolderInfo>,
     /// 攒着待推给宿主的那一发 `host.notes_changed`（§4.3 P3b）：改了状态的 op（`note.new`／`notes.rename`／保存）
@@ -527,6 +544,7 @@ impl Engine {
                     Err(error) => return failed("create_failed", error),
                 };
                 self.note_roots.insert(row.id, root.path().to_path_buf());
+                self.open_notes.insert(row.id);
                 sink(UiCommand::OpenNote {
                     note: OpenNote { note_id: row.id, folder_id: row.folder_id, path },
                 });
@@ -582,6 +600,32 @@ impl Engine {
                         }))
                     }
                     Err(error) => failed("rename_failed", error),
+                }
+            }
+            "note.delete" => {
+                let Some(id) = payload.get("note_id").and_then(Value::as_i64).filter(|id| *id > 0) else {
+                    return failed("bad_request", "note.delete 需要正整数 `note_id`".to_string());
+                };
+                let root = match payload.get("root") {
+                    None => self.root_for(&json!({})).map_err(|error| ("no_root", error)),
+                    Some(Value::String(path)) if !path.trim().is_empty() => {
+                        crate::plugin::storage::Root::open(Path::new(path))
+                            .map_err(|error| ("bad_request", error))
+                    }
+                    Some(_) => return failed("bad_request", "note.delete 的 `root` 必须是非空路径".to_string()),
+                };
+                match root.and_then(|root| self.delete_note_at(id, &root)) {
+                    Ok(outcome) => {
+                        if outcome.deleted {
+                            sink(UiCommand::NoteDeleted { note_id: id });
+                        }
+                        Dispatch::Done(json!({
+                            "note_id": id,
+                            "deleted": outcome.deleted,
+                            "warnings": outcome.warnings,
+                        }))
+                    }
+                    Err((code, message)) => failed(code, message),
                 }
             }
             "notes.info" => {
@@ -682,6 +726,7 @@ impl Engine {
         let root = self.root_for(&json!({}))?;
         let (row, path) = self.checked_open_note(&root, note_id)?;
         self.note_roots.insert(row.id, root.path().to_path_buf());
+        self.open_notes.insert(row.id);
         Ok(OpenNote { note_id: row.id, folder_id: row.folder_id, path })
     }
 
@@ -692,6 +737,7 @@ impl Engine {
             Err(error) => return failed("open_failed", error),
         };
         self.note_roots.insert(row.id, root.path().to_path_buf());
+        self.open_notes.insert(row.id);
         sink(UiCommand::OpenNote {
             note: OpenNote { note_id: row.id, folder_id: row.folder_id, path: abs },
         });
@@ -712,6 +758,13 @@ impl Engine {
             }
             EngineCommand::SaveFinished { note_id, path, reply } => {
                 let result = self.finish_save(note_id, &path);
+                let _ = reply.send(result);
+            }
+            EngineCommand::NoteClosed { note_id } => {
+                self.open_notes.remove(&note_id);
+            }
+            EngineCommand::DeleteLocal { note_id, reply } => {
+                let result = self.delete_note(note_id).map_err(|(_, message)| message);
                 let _ = reply.send(result);
             }
         }
@@ -775,6 +828,50 @@ impl Engine {
         Ok(())
     }
 
+    fn delete_note(&mut self, note_id: i64) -> Result<DeleteOutcome, (&'static str, String)> {
+        let root = self.root_for(&json!({})).map_err(|error| ("no_root", error))?;
+        self.delete_note_at(note_id, &root)
+    }
+
+    fn delete_note_at(
+        &mut self,
+        note_id: i64,
+        root: &crate::plugin::storage::Root,
+    ) -> Result<DeleteOutcome, (&'static str, String)> {
+        if self.open_notes.contains(&note_id) {
+            return Err(("busy", "笔记仍在编辑器里打开，请先关闭再删除".to_string()));
+        }
+        let row = match self.db.note(note_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                self.note_roots.remove(&note_id);
+                return Ok(DeleteOutcome { deleted: false, warnings: Vec::new() });
+            }
+            Err(error) => return Err(("delete_failed", error)),
+        };
+        if row.kind != NoteKind::Note {
+            return Err(("bad_request", format!("第 {note_id} 号不是笔记")));
+        }
+        if self.folders.iter().any(|folder| folder.id == row.folder_id && folder.locked) {
+            return Err(("locked", format!("第 {note_id} 号在锁定文件夹里")));
+        }
+        if row.enc.is_private() {
+            return Err(("private", format!("第 {note_id} 号是私有笔记")));
+        }
+        let deleted = match self.db.delete_note(&root, &row) {
+            Ok(Some(deleted)) => deleted,
+            Ok(None) => {
+                self.note_roots.remove(&note_id);
+                return Ok(DeleteOutcome { deleted: false, warnings: Vec::new() });
+            }
+            Err(error) => return Err(("delete_failed", error)),
+        };
+        self.note_roots.remove(&note_id);
+        self.open_notes.remove(&note_id);
+        self.note_changed(row.folder_id, row.id, "deleted");
+        Ok(DeleteOutcome { deleted: true, warnings: deleted.warnings })
+    }
+
     /// 攒一条待推的 `host.notes_changed`（§4.3 P3b）：载荷 `{folder, note_id, kind, title?}`，字段名照文档那一格。
     /// 只**记账**、不在 `handle` 里发（那里拿不到 `session`）——发由 [`serve`] 的泵在 `handle` 返回后做。
     /// 一条接一个：后一条盖过前一条（2 s TTL 还在兜底，推漏一条只是退化成今天的时延）。
@@ -817,6 +914,7 @@ fn serve_loop(
         db_path,
         root_path: None,
         note_roots: HashMap::new(),
+        open_notes: HashSet::new(),
         folders: Vec::new(),
         pending_change: None,
         sessions,
@@ -994,6 +1092,7 @@ enum AfterSave {
     None,
     Close,
     Open(OpenNote),
+    Delete(OpenNote),
 }
 
 impl Default for AfterSave {
@@ -1078,6 +1177,8 @@ struct PluginWindow {
     pending_recovery: Option<PendingRecovery>,
     dismiss_after_open: Option<RecoveryCandidate>,
     close_prompt: bool,
+    deleting: bool,
+    delete_prompt: bool,
 }
 
 impl PluginWindow {
@@ -1141,6 +1242,8 @@ impl PluginWindow {
             pending_recovery: None,
             dismiss_after_open: None,
             close_prompt: false,
+            deleting: false,
+            delete_prompt: false,
         }
     }
 
@@ -1197,7 +1300,7 @@ impl PluginWindow {
     }
 
     fn request_open_from_library(&mut self, note_id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.resolving_open || self.opening || self.saving || self.waiting_toc || self.close_prompt {
+        if self.resolving_open || self.opening || self.saving || self.waiting_toc || self.close_prompt || self.deleting {
             return;
         }
         if self.notes.iter().any(|note| note.note_id == note_id && note.locked) {
@@ -1227,6 +1330,9 @@ impl PluginWindow {
                 view.resolving_open = false;
                 if view.close_intent.pending {
                     view.close_intent.cancel();
+                    if let Ok(note) = &result {
+                        view.release_open(note.note_id);
+                    }
                     window.remove_window();
                     return;
                 }
@@ -1304,6 +1410,24 @@ impl PluginWindow {
                     self.schedule_library_refresh(cx);
                 }
             }
+            UiCommand::NoteDeleted { note_id } => {
+                if let Some(cancel) = self.open_cancel.take() {
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if self.opening_note.as_ref().is_some_and(|note| note.note_id == note_id) {
+                    self.open_generation = self.open_generation.wrapping_add(1);
+                    self.opening = false;
+                    self.opening_note = None;
+                }
+                self.pending_open = self.pending_open.take().filter(|note| note.note_id != note_id);
+                if self.note.as_ref().is_some_and(|note| note.note_id == note_id) {
+                    let _ = self.close_current(false, cx);
+                }
+                if self.document.is_none() {
+                    self.status = StatusMessage::text("plugin.status.deleted");
+                }
+                self.schedule_library_refresh(cx);
+            }
             UiCommand::Notice(message) => self.status = StatusMessage::raw(message),
             UiCommand::OpenBlank => self.status = StatusMessage::text("plugin.status.noNote"),
         }
@@ -1312,6 +1436,7 @@ impl PluginWindow {
 
     fn request_open(&mut self, note: OpenNote, window: &mut Window, cx: &mut Context<Self>) {
         if self.close_intent.pending {
+            self.release_open(note.note_id);
             return;
         }
         if self.resolving_open {
@@ -1359,7 +1484,9 @@ impl PluginWindow {
                                 view.open_note_now(note, window, cx);
                             }
                         }
-                        crate::ui::dialogs::SaveChoice::Cancel => {}
+                        crate::ui::dialogs::SaveChoice::Cancel => {
+                            view.release_open(note.note_id);
+                        }
                     }
                     cx.notify();
                 });
@@ -1370,6 +1497,132 @@ impl PluginWindow {
         if self.close_current(false, cx).is_ok() {
             self.open_note_now(note, window, cx);
         }
+    }
+
+    fn release_open(&mut self, note_id: i64) {
+        let _ = self.engine.send(EngineCommand::NoteClosed { note_id });
+    }
+
+    fn request_delete(&mut self, note: OpenNote, window: &mut Window, cx: &mut Context<Self>) {
+        if self.deleting || self.delete_prompt || self.close_prompt || self.opening || self.resolving_open {
+            return;
+        }
+        if self.saving || self.waiting_toc {
+            self.close_intent.queue(AfterSave::Delete(note));
+            return;
+        }
+        if self.index_pending.is_some() {
+            self.save(AfterSave::Delete(note), window, cx);
+            return;
+        }
+        self.delete_prompt = true;
+        let name = file_name(&note.path);
+        let response = window.prompt(
+            PromptLevel::Warning,
+            &plugin_text(cx, "plugin.delete.title"),
+            Some(&plugin_format(cx, "plugin.delete.body", &[("name", &name)])),
+            &[
+                PromptButton::new(plugin_text(cx, "plugin.delete.confirm")),
+                PromptButton::cancel(plugin_text(cx, "plugin.delete.cancel")),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |view, cx| {
+            let choice = response.await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                view.delete_prompt = false;
+                if matches!(choice, Ok(0)) {
+                    view.confirm_delete(note, window, cx);
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
+    }
+
+    fn confirm_delete(&mut self, note: OpenNote, window: &mut Window, cx: &mut Context<Self>) {
+        if self.note.as_ref().map(|current| current.note_id) != Some(note.note_id) {
+            return;
+        }
+        let dirty = self.document.as_ref().is_some_and(|document| document.read(cx).is_dirty(cx));
+        if !dirty {
+            if self.close_current(false, cx).is_ok() {
+                self.request_delete_now(note, window, cx);
+            }
+            return;
+        }
+        self.close_prompt = true;
+        let document = self.document.clone().expect("dirty document");
+        let response = crate::ui::dialogs::confirm_document_close(
+            document.read(cx).title_message(),
+            document.read(cx).has_failed_input(cx),
+            window,
+            cx,
+        );
+        cx.spawn_in(window, async move |view, cx| {
+            let choice = response.await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                view.close_prompt = false;
+                match choice {
+                    crate::ui::dialogs::SaveChoice::Save => {
+                        view.save(AfterSave::Delete(note), window, cx);
+                    }
+                    crate::ui::dialogs::SaveChoice::Discard => {
+                        if view.close_current(true, cx).is_ok() {
+                            view.request_delete_now(note, window, cx);
+                        }
+                    }
+                    crate::ui::dialogs::SaveChoice::Cancel => {}
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn request_delete_now(&mut self, note: OpenNote, window: &mut Window, cx: &mut Context<Self>) {
+        self.deleting = true;
+        self.failure = None;
+        self.status = StatusMessage::text("plugin.status.deleting");
+        let (reply, response) = oneshot::channel();
+        if self.engine.send(EngineCommand::DeleteLocal { note_id: note.note_id, reply }).is_err() {
+            self.deleting = false;
+            self.failure = Some(StatusMessage::text("plugin.error.deleteDisconnected"));
+            self.status = StatusMessage::text("plugin.status.deleteFailed");
+            cx.notify();
+            return;
+        }
+        cx.spawn_in(window, async move |view, cx| {
+            let result = match response.await {
+                Ok(result) => result.map_err(StatusMessage::raw),
+                Err(_) => Err(StatusMessage::text("plugin.error.noDeleteReply")),
+            };
+            let _ = view.update_in(cx, |view, _, cx| {
+                view.deleting = false;
+                match result {
+                    Ok(outcome) => {
+                        if outcome.deleted {
+                            view.status = if outcome.warnings.is_empty() {
+                                StatusMessage::text("plugin.status.deleted")
+                            } else {
+                                StatusMessage::localized(
+                                    "plugin.status.deletedWithWarning",
+                                    &[("warning", &outcome.warnings.join("；"))],
+                                )
+                            };
+                        } else {
+                            view.status = StatusMessage::text("plugin.status.deleteMissing");
+                        }
+                    }
+                    Err(error) => {
+                        view.failure = Some(error);
+                        view.status = StatusMessage::text("plugin.status.deleteFailed");
+                    }
+                }
+                view.schedule_library_refresh(cx);
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
     }
 
     fn open_note_now(&mut self, note: OpenNote, window: &mut Window, cx: &mut Context<Self>) {
@@ -1439,6 +1692,7 @@ impl PluginWindow {
         cx: &mut Context<Self>,
     ) {
         if generation != self.open_generation {
+            self.release_open(note.note_id);
             if let Ok(PreparedOpen::Document { port, .. }) = result {
                 cx.background_executor()
                     .spawn(async move { let _ = port.release_unmounted(); })
@@ -1454,6 +1708,7 @@ impl PluginWindow {
             .unwrap_or(note);
         if self.close_intent.pending {
             self.close_intent.cancel();
+            self.release_open(note.note_id);
             if let Ok(PreparedOpen::Document { port, .. }) = result {
                 cx.background_executor()
                     .spawn(async move { let _ = port.release_unmounted(); })
@@ -1474,7 +1729,7 @@ impl PluginWindow {
                 if note.path != requested_path {
                     self.begin_open(note, true, None, window, cx);
                 } else {
-                    self.fail_open(error, cx);
+                    self.fail_open(note.note_id, error, cx);
                 }
             }
         }
@@ -1493,7 +1748,7 @@ impl PluginWindow {
             cx.background_executor()
                 .spawn(async move { let _ = port.release_unmounted(); })
                 .detach();
-            self.fail_open(format!(
+            self.fail_open(note.note_id, format!(
                 "正文 {} B 超过可编辑上限 {} B",
                 status.byte_length,
                 crate::plugin::storage::MAX_DOC_BYTES
@@ -1508,7 +1763,7 @@ impl PluginWindow {
                 cx.background_executor()
                     .spawn(async move { let _ = port.release_unmounted(); })
                     .detach();
-                self.fail_open(error.to_string(), cx);
+                self.fail_open(note.note_id, error.to_string(), cx);
                 return;
             }
         };
@@ -1523,7 +1778,7 @@ impl PluginWindow {
                 cx.background_executor()
                     .spawn(async move { let _ = port.release_unmounted(); })
                     .detach();
-                self.fail_open(error.to_string(), cx);
+                self.fail_open(note.note_id, error.to_string(), cx);
                 return;
             }
         };
@@ -1589,6 +1844,7 @@ impl PluginWindow {
                     Ok(0) => view.recover_note(pending.note, pending.candidate, window, cx),
                     Ok(1) => view.begin_open(pending.note, false, Some(pending.candidate), window, cx),
                     _ => {
+                        view.release_open(pending.note.note_id);
                         view.status = StatusMessage::text("plugin.status.recoveryKept");
                         if let Some(note) = view.pending_open.take() {
                             view.request_open(note, window, cx);
@@ -1641,10 +1897,11 @@ impl PluginWindow {
         cx.notify();
     }
 
-    fn fail_open(&mut self, error: String, cx: &mut Context<Self>) {
+    fn fail_open(&mut self, note_id: i64, error: String, cx: &mut Context<Self>) {
         self.opening = false;
         self.opening_note = None;
         self.dismiss_after_open = None;
+        self.release_open(note_id);
         self.failure = Some(StatusMessage::raw(error));
         self.status = StatusMessage::text("plugin.status.openFailed");
         cx.notify();
@@ -1733,8 +1990,10 @@ impl PluginWindow {
             return;
         }
         let (Some(document), Some(note)) = (self.document.clone(), self.note.clone()) else {
-            if matches!(after, AfterSave::Close) {
-                window.remove_window();
+            match after {
+                AfterSave::Close => window.remove_window(),
+                AfterSave::Delete(note) => self.request_delete_now(note, window, cx),
+                AfterSave::None | AfterSave::Open(_) => {}
             }
             return;
         };
@@ -1950,6 +2209,11 @@ impl PluginWindow {
                     self.open_note_now(note, window, cx);
                 }
             }
+            AfterSave::Delete(note) => {
+                if self.close_current(false, cx).is_ok() {
+                    self.request_delete_now(note, window, cx);
+                }
+            }
         }
     }
 
@@ -1969,6 +2233,9 @@ impl PluginWindow {
         }
         self.autosave = None;
         self.subscription = None;
+        if let Some(note) = self.note.clone() {
+            self.release_open(note.note_id);
+        }
         self.document = None;
         self.note = None;
         self.index_pending = None;
@@ -2063,8 +2330,9 @@ fn retarget_queued_notes(
     retarget_open_note(index_pending, note_id, path);
     retarget_open_note(opening_note, note_id, path);
     retarget_open_note(pending_open, note_id, path);
-    if let AfterSave::Open(note) = after_save {
-        retarget_note(note, note_id, path);
+    match after_save {
+        AfterSave::Open(note) | AfterSave::Delete(note) => retarget_note(note, note_id, path),
+        AfterSave::None | AfterSave::Close => {}
     }
 }
 
@@ -2098,6 +2366,17 @@ impl Render for PluginWindow {
         } else {
             crate::ui::components::ButtonKind::Secondary
         };
+        let delete_button = self.note.clone().map(|note| {
+            crate::ui::components::button(
+                "plugin-delete-note",
+                plugin_text(cx, "plugin.delete.label"),
+                Some(crate::ui::components::IconName::Trash2),
+                if self.deleting { crate::ui::components::ButtonKind::Disabled } else { crate::ui::components::ButtonKind::Secondary },
+                &theme,
+            ).on_click(cx.listener(move |view, _, window, cx| {
+                view.request_delete(note.clone(), window, cx);
+            }))
+        });
 
         let mut all_row = div().id("plugin-library-all").h(px(32.0)).mx(px(8.0)).px(px(10.0))
             .flex().items_center().gap(px(8.0)).rounded(px(6.0)).cursor_pointer()
@@ -2231,12 +2510,13 @@ impl Render for PluginWindow {
                     .px_4().border_b_1().border_color(theme.border).bg(theme.surface)
                     .child(div().min_w_0().truncate().text_size(px(14.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme.fg).child(title))
-                    .child(crate::ui::components::button(
-                        "plugin-save-note", save_label, Some(crate::ui::components::IconName::Save),
-                        save_kind, &theme,
-                    ).on_click(cx.listener(|view, _, window, cx| {
-                        view.save(AfterSave::None, window, cx);
-                    }))),
+                    .child(div().flex().items_center().gap_2().children(delete_button)
+                        .child(crate::ui::components::button(
+                            "plugin-save-note", save_label, Some(crate::ui::components::IconName::Save),
+                            save_kind, &theme,
+                        ).on_click(cx.listener(|view, _, window, cx| {
+                            view.save(AfterSave::None, window, cx);
+                        }))))
             )
             .child(div().flex_1().min_h_0().flex().child(sidebar).child(body).children(empty))
             .children(error)
@@ -2375,6 +2655,7 @@ mod tests {
             db_path: db_path.to_path_buf(),
             root_path: None,
             note_roots: HashMap::new(),
+            open_notes: HashSet::new(),
             folders: Vec::new(),
             pending_change: None,
             sessions: None,
@@ -2807,6 +3088,174 @@ mod tests {
         update_note_for_test(&engine, "UPDATE notes SET enc=0 WHERE id=?1", note.note_id);
         std::fs::write(&note.path, "x".repeat(crate::plugin::storage::MAX_DOC_BYTES + 1)).unwrap();
         assert!(open_local_command(&mut engine, note.note_id).unwrap_err().contains("超过可编辑上限"));
+    }
+
+    #[test]
+    fn delete_op_validates_identity_root_and_missing_rows() {
+        let data = tempfile::Builder::new().prefix("nomo-rt-delete-validate-db").tempdir().unwrap();
+        let root = tempfile::Builder::new().prefix("nomo-rt-delete-validate-root").tempdir().unwrap();
+        let mut engine = engine(&data.path().join("notes.db"));
+
+        assert_eq!(
+            engine.handle("note.delete", json!({ "note_id": 0 }), &mut |_| {}),
+            Dispatch::Failed { code: "bad_request".into(), message: "note.delete 需要正整数 `note_id`".into() }
+        );
+        assert_eq!(
+            engine.handle("note.delete", json!({ "note_id": 1, "root": 42 }), &mut |_| {}),
+            Dispatch::Failed { code: "bad_request".into(), message: "note.delete 的 `root` 必须是非空路径".into() }
+        );
+        assert_eq!(
+            engine.handle("note.delete", json!({ "note_id": 1 }), &mut |_| {}),
+            Dispatch::Failed { code: "no_root".into(), message: "还没收到 root（`folders.snapshot` 里那一格），这一发办不了".into() }
+        );
+
+        let mut sink = Vec::new();
+        let done = engine.handle(
+            "note.delete",
+            json!({ "note_id": 999, "root": root.path().to_string_lossy() }),
+            &mut |command| sink.push(command),
+        );
+        assert_eq!(done, Dispatch::Done(json!({
+            "note_id": 999,
+            "deleted": false,
+            "warnings": [],
+        })));
+        assert!(sink.is_empty(), "幂等空删不发删除通知：{sink:?}");
+    }
+
+    #[test]
+    fn delete_op_refuses_an_open_note_until_the_session_closes() {
+        let data = tempfile::Builder::new().prefix("nomo-rt-delete-open-db").tempdir().unwrap();
+        let root = tempfile::Builder::new().prefix("nomo-rt-delete-open-root").tempdir().unwrap();
+        let mut engine = engine(&data.path().join("notes.db"));
+        let note = create_note(&mut engine, &root.path().to_string_lossy());
+        std::fs::write(&note.path, "# 打开中\n").unwrap();
+        engine.pending_change = None;
+        let mut sink = Vec::new();
+
+        let busy = engine.handle("note.delete", json!({ "note_id": note.note_id }), &mut |c| sink.push(c));
+        assert_eq!(busy, Dispatch::Failed {
+            code: "busy".into(),
+            message: "笔记仍在编辑器里打开，请先关闭再删除".into(),
+        });
+        assert!(note.path.exists());
+        assert!(engine.db.note(note.note_id).unwrap().is_some());
+        assert!(sink.is_empty());
+
+        engine.handle_command(EngineCommand::NoteClosed { note_id: note.note_id });
+        assert!(!engine.open_notes.contains(&note.note_id));
+        let done = engine.handle("note.delete", json!({ "note_id": note.note_id }), &mut |c| sink.push(c));
+        assert_eq!(done, Dispatch::Done(json!({
+            "note_id": note.note_id,
+            "deleted": true,
+            "warnings": [],
+        })));
+        assert!(!note.path.exists());
+        assert!(engine.db.note(note.note_id).unwrap().is_none());
+        assert_eq!(sink, vec![UiCommand::NoteDeleted { note_id: note.note_id }]);
+        assert_eq!(engine.pending_change, Some(json!({
+            "folder": 7,
+            "note_id": note.note_id,
+            "kind": "deleted",
+        })));
+
+        sink.clear();
+        let again = engine.handle("note.delete", json!({ "note_id": note.note_id }), &mut |c| sink.push(c));
+        assert_eq!(again, Dispatch::Done(json!({
+            "note_id": note.note_id,
+            "deleted": false,
+            "warnings": [],
+        })));
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn delete_op_rejects_private_locked_and_non_note_rows() {
+        let data = tempfile::Builder::new().prefix("nomo-rt-delete-guards-db").tempdir().unwrap();
+        let root = tempfile::Builder::new().prefix("nomo-rt-delete-guards-root").tempdir().unwrap();
+        let mut engine = engine(&data.path().join("notes.db"));
+        let note = create_note(&mut engine, &root.path().to_string_lossy());
+        engine.handle_command(EngineCommand::NoteClosed { note_id: note.note_id });
+
+        update_note_for_test(&engine, "UPDATE notes SET enc=1 WHERE id=?1", note.note_id);
+        assert_eq!(
+            engine.handle("note.delete", json!({ "note_id": note.note_id }), &mut |_| {}),
+            Dispatch::Failed { code: "private".into(), message: format!("第 {} 号是私有笔记", note.note_id) }
+        );
+        assert!(engine.db.note(note.note_id).unwrap().is_some());
+
+        update_note_for_test(&engine, "UPDATE notes SET enc=0, kind='todo' WHERE id=?1", note.note_id);
+        assert_eq!(
+            engine.handle("note.delete", json!({ "note_id": note.note_id }), &mut |_| {}),
+            Dispatch::Failed { code: "bad_request".into(), message: format!("第 {} 号不是笔记", note.note_id) }
+        );
+        assert!(engine.db.note(note.note_id).unwrap().is_some());
+
+        update_note_for_test(&engine, "UPDATE notes SET kind='note' WHERE id=?1", note.note_id);
+        engine.handle(
+            "folders.snapshot",
+            json!({
+                "root": root.path().to_string_lossy(),
+                "folders": [{ "id": 7, "dir_name": "inbox", "locked": true }]
+            }),
+            &mut |_| {},
+        );
+        assert_eq!(
+            engine.handle("note.delete", json!({ "note_id": note.note_id }), &mut |_| {}),
+            Dispatch::Failed { code: "locked".into(), message: format!("第 {} 号在锁定文件夹里", note.note_id) }
+        );
+        assert!(engine.db.note(note.note_id).unwrap().is_some());
+        assert!(note.path.exists());
+    }
+
+    #[test]
+    fn delete_local_uses_the_same_guards_as_the_host_op() {
+        let data = tempfile::Builder::new().prefix("nomo-rt-delete-local-db").tempdir().unwrap();
+        let root = tempfile::Builder::new().prefix("nomo-rt-delete-local-root").tempdir().unwrap();
+        let mut engine = engine(&data.path().join("notes.db"));
+        let note = create_note(&mut engine, &root.path().to_string_lossy());
+        let (reply, response) = oneshot::channel();
+        engine.handle_command(EngineCommand::DeleteLocal { note_id: note.note_id, reply });
+        assert!(response.blocking_recv().unwrap().unwrap_err().contains("仍在编辑器里打开"));
+
+        engine.handle_command(EngineCommand::NoteClosed { note_id: note.note_id });
+        let (reply, response) = oneshot::channel();
+        engine.handle_command(EngineCommand::DeleteLocal { note_id: note.note_id, reply });
+        assert_eq!(response.blocking_recv().unwrap().unwrap(), DeleteOutcome {
+            deleted: true,
+            warnings: Vec::new(),
+        });
+        assert!(!note.path.exists());
+    }
+
+    #[test]
+    fn queued_delete_follows_renames_and_yields_to_window_close() {
+        let note = OpenNote { note_id: 7, folder_id: 3, path: PathBuf::from("old.md") };
+        let mut current = Some(note.clone());
+        let mut index_pending = Some(note.clone());
+        let mut opening_note = Some(note.clone());
+        let mut pending_open = Some(note.clone());
+        let mut after_save = AfterSave::Delete(note.clone());
+        let renamed = PathBuf::from("new.md");
+
+        retarget_queued_notes(
+            &mut current,
+            &mut index_pending,
+            &mut opening_note,
+            &mut pending_open,
+            &mut after_save,
+            7,
+            &renamed,
+        );
+        let expected = OpenNote { note_id: 7, folder_id: 3, path: renamed };
+        assert_eq!(after_save, AfterSave::Delete(expected));
+
+        let mut intent = CloseIntent::default();
+        intent.queue(AfterSave::Delete(note.clone()));
+        intent.queue(AfterSave::Close);
+        intent.queue(AfterSave::Delete(note));
+        assert!(intent.pending);
+        assert_eq!(intent.take_after_save(), AfterSave::Close);
     }
 
     #[test]

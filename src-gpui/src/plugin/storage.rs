@@ -185,6 +185,14 @@ impl std::fmt::Display for RenameBodyError {
 
 impl std::error::Error for RenameBodyError {}
 
+/// 数据库提交后待清理的文件；清理失败只留孤儿，不把已消失的数据库行改回来。
+#[derive(Debug)]
+pub struct DeletedNote {
+    pub body_path: Option<PathBuf>,
+    pub asset_paths: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
 impl Db {
     /// 开库并跑迁移：先读 `PRAGMA user_version`，比 [`SCHEMA_VERSION`] **新**就整个拒（一个字都不写）。
     ///
@@ -379,6 +387,53 @@ impl Db {
             )));
         }
         Ok(new_abs)
+    }
+
+    /// 事务删除笔记行与全部附件行，再清理对应文件。身份列或正文路径在事务里漂移则整趟回滚。
+    pub fn delete_note(&mut self, root: &Root, expected: &NoteRow) -> Res<Option<DeletedNote>> {
+        let tx = self.conn.transaction().es()?;
+        let sql = format!("SELECT {NOTE_COLUMNS} FROM notes WHERE id=?1");
+        let current = tx.query_row(&sql, params![expected.id], read_note)
+            .optional()
+            .es()?;
+        let Some(current) = current else { return Ok(None) };
+        if current.kind != expected.kind
+            || current.folder_id != expected.folder_id
+            || current.enc != expected.enc
+            || current.body_path != expected.body_path
+        {
+            return Err(format!("第 {} 号笔记已被别处改动，这次删除作废", expected.id));
+        }
+        let body_path = if current.body_path.is_empty() {
+            None
+        } else {
+            Some(root.resolve(&current.body_path)?)
+        };
+        let mut stmt = tx.prepare("SELECT rel_path FROM note_assets WHERE note_id=?1 ORDER BY rowid").es()?;
+        let rows = stmt.query_map(params![current.id], |row| row.get::<_, String>(0)).es()?;
+        let mut asset_paths = Vec::new();
+        for rel in rows {
+            asset_paths.push(root.resolve(&rel.es()?)?);
+        }
+        drop(stmt);
+        tx.execute("DELETE FROM note_assets WHERE note_id=?1", params![current.id]).es()?;
+        let changed = tx.execute(
+            "DELETE FROM notes WHERE id=?1 AND kind=?2 AND folder_id=?3 AND enc=?4 AND body_path=?5",
+            params![current.id, current.kind.as_str(), current.folder_id, current.enc.bit(), current.body_path],
+        ).es()?;
+        if changed != 1 {
+            return Err(format!("第 {} 号笔记删除时身份对不上", current.id));
+        }
+        tx.commit().es()?;
+
+        let mut warnings = Vec::new();
+        if let Some(path) = &body_path {
+            remove_deleted_file(path, "正文", &mut warnings);
+        }
+        for path in &asset_paths {
+            remove_deleted_file(path, "附件", &mut warnings);
+        }
+        Ok(Some(DeletedNote { body_path, asset_paths, warnings }))
     }
 
     /// 只读点查标题（op `notes.info` 用）：**不建库、不迁移、不设 WAL**，只 `SELECT title, enc`。
@@ -627,6 +682,14 @@ pub fn clean_note_stem(raw: &str) -> Res<String> {
     Ok(s)
 }
 
+fn remove_deleted_file(path: &Path, label: &str, warnings: &mut Vec<String>) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warnings.push(format!("{label} {} 删除失败：{error}", path.display())),
+    }
+}
+
 /// 原子写：同目录临时名 `<name>.tmp-<pid>-<seq>` → `create_new`+`0600`（unix）→ write → fsync → rename。
 ///
 /// 只留一个写手在这条路上；失败留原文件不动、删临时。`create_new` 撞同名（同 pid+seq）失败而非接管半截文件。
@@ -792,6 +855,15 @@ mod tests {
         tempfile::Builder::new().prefix(&format!("nomo-plugin-{tag}")).tempdir().unwrap()
     }
 
+    fn insert_asset(db: &Db, note_id: i64, rel_path: &str) {
+        db.conn.execute(
+            "INSERT INTO note_assets \
+             (id, note_id, kind, rel_path, source_kind, source_ref, bytes, width, height, frames, duration_ms, sha256, created_at_ms) \
+             VALUES (?1, ?2, 'image', ?3, 'file', '', 1, NULL, NULL, NULL, NULL, 'x', 1)",
+            params![format!("asset-{note_id}"), note_id, rel_path],
+        ).unwrap();
+    }
+
     #[test]
     fn open_creates_schema_and_is_idempotent() {
         let d = temp_dir("schema");
@@ -911,6 +983,108 @@ mod tests {
         assert!(!old_abs.with_file_name("新名.md").exists(), "SQL 失败后新文件不能留下");
         let back = conn.note(row.id).unwrap().unwrap();
         assert_eq!(back.body_path, row.body_path, "SQL 失败后数据库路径必须保持旧值");
+    }
+
+    #[test]
+    fn delete_note_cascades_assets_and_removes_files_idempotently() {
+        let d = temp_dir("delete");
+        let db_path = d.path().join("notes.db");
+        let mut db = Db::open(&db_path).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let row = db.create_note(&root, "inbox", 7).unwrap();
+        let body = root.resolve(&row.body_path).unwrap();
+        std::fs::write(&body, "# 待删\n").unwrap();
+        let asset_rel = format!("folders/inbox/notes/a/{}.png", row.id);
+        let asset = root.resolve(&asset_rel).unwrap();
+        std::fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        std::fs::write(&asset, b"png").unwrap();
+        insert_asset(&db, row.id, &asset_rel);
+
+        let deleted = db.delete_note(&root, &row).unwrap().expect("第一次删除该命中");
+        assert!(deleted.warnings.is_empty(), "{:?}", deleted.warnings);
+        assert!(!body.exists());
+        assert!(!asset.exists());
+        assert!(db.note(row.id).unwrap().is_none());
+        let assets: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM note_assets WHERE note_id=?1", [row.id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(assets, 0);
+        assert!(db.delete_note(&root, &row).unwrap().is_none(), "第二次删除应幂等");
+        assert!(body.parent().unwrap().is_dir(), "删除单篇笔记不裁剪目录");
+    }
+
+    #[test]
+    fn delete_note_rolls_back_db_and_keeps_files_when_sql_fails() {
+        let d = temp_dir("delete-rollback");
+        let mut db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let row = db.create_note(&root, "inbox", 7).unwrap();
+        let body = root.resolve(&row.body_path).unwrap();
+        std::fs::write(&body, "keep").unwrap();
+        let asset_rel = format!("folders/inbox/notes/a/{}.png", row.id);
+        let asset = root.resolve(&asset_rel).unwrap();
+        std::fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        std::fs::write(&asset, b"keep").unwrap();
+        insert_asset(&db, row.id, &asset_rel);
+        db.conn.execute_batch(
+            "CREATE TRIGGER reject_note_delete BEFORE DELETE ON notes \
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        ).unwrap();
+
+        assert!(db.delete_note(&root, &row).is_err());
+        assert!(db.note(row.id).unwrap().is_some());
+        let assets: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM note_assets WHERE note_id=?1", [row.id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(assets, 1);
+        assert!(body.exists());
+        assert!(asset.exists());
+    }
+
+    #[test]
+    fn delete_note_rejects_asset_escape_before_committing() {
+        let d = temp_dir("delete-escape");
+        let mut db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let row = db.create_note(&root, "inbox", 7).unwrap();
+        let body = root.resolve(&row.body_path).unwrap();
+        insert_asset(&db, row.id, "../outside.png");
+
+        assert!(db.delete_note(&root, &row).is_err());
+        assert!(db.note(row.id).unwrap().is_some());
+        assert!(body.exists());
+    }
+
+    #[test]
+    fn delete_note_rejects_changed_identity_before_removing_files() {
+        let d = temp_dir("delete-identity");
+        let mut db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let row = db.create_note(&root, "inbox", 7).unwrap();
+        let body = root.resolve(&row.body_path).unwrap();
+        std::fs::write(&body, "keep").unwrap();
+        db.conn.execute("UPDATE notes SET folder_id=8 WHERE id=?1", [row.id]).unwrap();
+
+        assert!(db.delete_note(&root, &row).unwrap_err().contains("已被别处改动"));
+        assert!(body.exists());
+        let current = db.note(row.id).unwrap().unwrap();
+        assert_eq!(current.folder_id, 8);
+    }
+
+    #[test]
+    fn delete_note_reports_file_cleanup_failures_without_restoring_rows() {
+        let d = temp_dir("delete-warning");
+        let mut db = Db::open(&d.path().join("notes.db")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let row = db.create_note(&root, "inbox", 7).unwrap();
+        let body = root.resolve(&row.body_path).unwrap();
+        std::fs::remove_file(&body).unwrap();
+        std::fs::create_dir(&body).unwrap();
+
+        let deleted = db.delete_note(&root, &row).unwrap().expect("数据库删除该提交");
+        assert!(deleted.warnings.iter().any(|warning| warning.contains("正文")), "{:?}", deleted.warnings);
+        assert!(db.note(row.id).unwrap().is_none());
+        assert!(body.is_dir(), "删不掉的文件留作孤儿，不伪造清理成功");
     }
 
     #[test]
