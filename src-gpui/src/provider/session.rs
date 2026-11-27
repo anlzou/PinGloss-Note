@@ -22,13 +22,13 @@ pub(crate) enum Command {
 }
 
 /// 开出去的那一趟读：键是谁＋哪一代开的。答复回来时凭这两样判断它还作不作数。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReadTicket {
     pub(crate) key: CacheKey,
     pub(crate) generation: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Begin {
     /// 本趟就是当下唯一在飞的读。
     Admitted(ReadTicket),
@@ -91,7 +91,7 @@ impl ProviderSession {
     }
 
     pub(crate) fn in_flight(&self) -> Option<CacheKey> {
-        self.in_flight.map(|ticket| ticket.key)
+        self.in_flight.clone().map(|ticket| ticket.key)
     }
 
     pub(crate) fn pending(&self) -> usize {
@@ -108,7 +108,9 @@ impl ProviderSession {
             key,
             generation: self.generation,
         };
-        match self.in_flight.replace(ticket) {
+        // 键带着游标字串：占格的那一份留下，被挤掉的那枚交回调用方逐格报回。
+        let stale = self.in_flight.replace(ticket.clone());
+        match stale {
             None => Begin::Admitted(ticket),
             Some(stale) => Begin::Displaced { stale, ticket },
         }
@@ -122,13 +124,18 @@ impl ProviderSession {
         if ticket.generation != self.generation {
             return Settle::Discarded("stale_generation");
         }
-        match self.in_flight {
-            Some(current) if current == *ticket => {
-                self.in_flight = None;
-                Settle::Applied
+        // 取出来比：认得就还不回，这一趟落定、格子空出来；不认得原样放回继续占位。
+        let current = self.in_flight.take();
+        match current {
+            Some(ongoing) if ongoing == *ticket => Settle::Applied,
+            other => {
+                self.in_flight = other;
+                if self.in_flight.is_some() {
+                    Settle::Discarded("superseded")
+                } else {
+                    Settle::Discarded("no_read_in_flight")
+                }
             }
-            Some(_) => Settle::Discarded("superseded"),
-            None => Settle::Discarded("no_read_in_flight"),
         }
     }
 
@@ -176,7 +183,15 @@ mod tests {
     use super::*;
 
     fn children(folder_id: i64) -> CacheKey {
-        CacheKey::Children { folder_id }
+        CacheKey::Children { folder_id, cursor: None }
+    }
+
+    fn roots() -> CacheKey {
+        CacheKey::Roots { cursor: None }
+    }
+
+    fn recent() -> CacheKey {
+        CacheKey::Recent
     }
 
     fn open(note_id: i64) -> Command {
@@ -187,11 +202,11 @@ mod tests {
     #[test]
     fn only_the_newest_metadata_read_survives() {
         let mut session = ProviderSession::new();
-        let first = match session.begin_read(CacheKey::Roots) {
+        let first = match session.begin_read(roots()) {
             Begin::Admitted(ticket) => ticket,
             other => panic!("第一趟读没被准入：{other:?}"),
         };
-        assert_eq!(session.in_flight(), Some(CacheKey::Roots));
+        assert_eq!(session.in_flight(), Some(roots()));
 
         let second = match session.begin_read(children(3)) {
             Begin::Displaced { stale, ticket } => {
@@ -214,7 +229,7 @@ mod tests {
     #[test]
     fn an_answer_from_the_previous_connection_is_dropped() {
         let mut session = ProviderSession::new();
-        let stale = match session.begin_read(CacheKey::Recent) {
+        let stale = match session.begin_read(recent()) {
             Begin::Admitted(ticket) => ticket,
             other => panic!("{other:?}"),
         };
@@ -225,7 +240,7 @@ mod tests {
             "旧代次的答复被当成新一代的读数"
         );
 
-        let fresh = match session.begin_read(CacheKey::Recent) {
+        let fresh = match session.begin_read(recent()) {
             Begin::Admitted(ticket) => ticket,
             other => panic!("重连后开不了新读：{other:?}"),
         };
@@ -316,7 +331,7 @@ mod tests {
     #[test]
     fn going_offline_hands_back_every_unsent_command() {
         let mut session = ProviderSession::new();
-        let ticket = match session.begin_read(CacheKey::Roots) {
+        let ticket = match session.begin_read(roots()) {
             Begin::Admitted(ticket) => ticket,
             other => panic!("{other:?}"),
         };
@@ -334,16 +349,16 @@ mod tests {
             "断线后的答复还算成了读数"
         );
         assert_eq!(session.enqueue(open(4)), Enqueue::Offline);
-        assert_eq!(session.begin_read(CacheKey::Recent), Begin::Offline);
+        assert_eq!(session.begin_read(recent()), Begin::Offline);
     }
 
     #[test]
     fn reconnect_admits_reads_again() {
         let mut session = ProviderSession::new();
         session.go_offline();
-        assert_eq!(session.begin_read(CacheKey::Roots), Begin::Offline);
+        assert_eq!(session.begin_read(roots()), Begin::Offline);
         assert_eq!(session.reconnect(), 2, "重连没有起新一代");
-        match session.begin_read(CacheKey::Roots) {
+        match session.begin_read(roots()) {
             Begin::Admitted(ticket) => assert_eq!(ticket.generation, session.generation()),
             other => panic!("重连后仍然开不了读：{other:?}"),
         }
@@ -362,7 +377,7 @@ mod tests {
         assert_eq!(session.settle_read(&ticket), Settle::Applied);
         assert!(
             cache.insert(
-                children(1),
+                &children(1),
                 Cached::Directory(Page {
                     nodes: vec![ProviderNode::Folder {
                         id: "folder:1".to_string(),
@@ -378,7 +393,7 @@ mod tests {
         session.go_offline();
         assert!(!session.is_online());
         let kept = cache
-            .get(children(1))
+            .get(&children(1))
             .and_then(Cached::as_directory)
             .expect("断线把上次可见的目录清空了");
         assert_eq!((kept.nodes.len(), kept.nodes[0].name()), (1, Some("甲")));

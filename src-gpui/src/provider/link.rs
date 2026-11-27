@@ -6,8 +6,9 @@
 //! 直接写进线程的话，"答复落错格子""断线丢命令"这两类病只能在真机上复现；抽出来之后每件事都能
 //! 当场对账。事件只说发生了什么，缓存是唯一事实出处，调用方读 `cache()` 取页——一份状态不会两头漂。
 //!
-//! ⚠ 翻页那一格还没进来：`CacheKey` 里没有游标位，所以答复里的 `next_cursor` 只随页存着，本机从不问
-//! 第二页。`Link` 也不持句柄，因而是单线程使用的状态机；工作线程把读到的字节送进来、把要写的字节取走。
+//! `Link` 也不持句柄，因而是单线程使用的状态机；工作线程把读到的字节送进来、把要写的字节取走。
+//! 翻页那一格住在 `CacheKey` 上：目录两形各带一位游标，`None` 是首次展开，下一页的游标由调用方从缓存里
+//! 那一页的 `next_cursor` 取来。⚠ 游标对 Nomo 不透明，只原样带回宿主，不解析也不进日志。
 use serde_json::Value;
 
 use super::cache::{CacheKey, Cached, ProviderCache};
@@ -105,13 +106,14 @@ impl Link {
     }
 
     /// 要画某一格。缓存里有就一行都不发；离线当场报回，不在这一截攒着等重连。
+    /// 键带着游标，所以问第二页不会把看过的第一页挤掉——一夹的每一页各自占一格。
     pub(crate) fn want_page(&mut self, key: CacheKey, now_ms: u64) -> Vec<LinkEvent> {
         let mut events = Vec::new();
-        if self.cache.get(key).is_some() {
+        if self.cache.get(&key).is_some() {
             return events;
         }
         // 先过自家形状闸：问不出去的形状不留账，否则症状是"点开了却永远转圈"。
-        let Some(request) = read_request(self.pending.next_id(), key) else {
+        let Some(request) = read_request(self.pending.next_id(), &key) else {
             events.push(LinkEvent::PageFailed(
                 key,
                 "这一格的号问不出去：文件夹号不是正整数".to_string(),
@@ -125,20 +127,20 @@ impl Link {
             ));
             return events;
         };
-        let ticket = match self.session.begin_read(key) {
+        let (ticket, squeezed_out) = match self.session.begin_read(key.clone()) {
             Begin::Offline => {
-                events.push(LinkEvent::PageFailed(key, "离线".to_string()));
-                return events;
+                return vec![LinkEvent::PageFailed(key, "离线".to_string())];
             }
-            Begin::Admitted(ticket) | Begin::Displaced { ticket, .. } => ticket,
+            Begin::Admitted(ticket) => (ticket, None),
+            // 挤掉上一趟时把那一枚的键留下：本截要当场报回那一格，屏上才不留永远转圈的槽。
+            Begin::Displaced { stale, ticket } => (ticket, Some(stale.key)),
         };
-        // 换号同时把上一趟的来路撤账：它晚点回来只交 `Unknown`。被挤掉的那一格不会有人再等到答复，
-        // 当场报回，屏上才不会留一个永远转圈的槽。
+        // 换号同时把上一趟的来路撤账：它晚点回来只交 `Unknown`。
         let stale = self
             .pending
             .attach_read(request.request_id().to_string(), ticket, now_ms + READ_TIMEOUT_MS);
-        if let Some(stale) = stale {
-            events.push(LinkEvent::PageFailed(stale.key, "被更近的一次展开挤掉".to_string()));
+        if let Some(key) = squeezed_out.or_else(|| stale.map(|stale| stale.key)) {
+            events.push(LinkEvent::PageFailed(key, "被更近的一次展开挤掉".to_string()));
         }
         self.outbound.push(line);
         events
@@ -258,9 +260,9 @@ impl Link {
                 if self.session.settle_read(&ticket) != Settle::Applied {
                     return;
                 }
-                match project(ticket.key, &payload) {
+                match project(&ticket.key, &payload) {
                     Ok(page) => {
-                        if self.cache.insert(ticket.key, page) {
+                        if self.cache.insert(&ticket.key, page) {
                             events.push(LinkEvent::PageReady(ticket.key));
                         } else {
                             // 留不住的一格等于没读到：报回去，别让调用方去缓存里取那一格却取到空。
@@ -277,7 +279,7 @@ impl Link {
                 Ok(changed) => {
                     events.push(LinkEvent::CommandDone(command));
                     // 首页那一格现在一定旧了：那一条要么上了顶，要么被摘走。没动过账就不作废。
-                    if changed && self.cache.invalidate(CacheKey::Recent) {
+                    if changed && self.cache.invalidate(&CacheKey::Recent) {
                         events.push(LinkEvent::Invalidated(CacheKey::Recent));
                     }
                 }
@@ -311,13 +313,13 @@ impl Link {
         if event != EVENT_NOTES_CHANGED {
             return;
         }
-        if let Some(key) = folder.map(|folder_id| CacheKey::Children { folder_id }) {
-            if self.cache.invalidate(key) {
+        if let Some(folder_id) = folder {
+            for key in self.cache.invalidate_folder(folder_id) {
                 events.push(LinkEvent::Invalidated(key));
             }
         }
         let touches_recent = kind.is_some_and(|which| STALE_RECENT_KINDS.contains(&which));
-        if touches_recent && self.cache.invalidate(CacheKey::Recent) {
+        if touches_recent && self.cache.invalidate(&CacheKey::Recent) {
             events.push(LinkEvent::Invalidated(CacheKey::Recent));
         }
     }
@@ -348,24 +350,23 @@ impl Link {
 }
 
 /// 那一格要问的那一行。`Children{0}` 是宿主整行拒收的形状，在这里就地拦下。
-fn read_request(request_id: String, key: CacheKey) -> Option<NotesRequest> {
+fn read_request(request_id: String, key: &CacheKey) -> Option<NotesRequest> {
     match key {
-        CacheKey::Roots => Some(NotesRequest::Roots {
+        CacheKey::Roots { cursor } => Some(NotesRequest::Roots {
             request_id,
-            cursor: None,
+            cursor: cursor.clone(),
             limit: None,
         }),
-        CacheKey::Children { folder_id } if folder_id > 0 => Some(NotesRequest::Children {
-            request_id,
-            folder_id,
-            cursor: None,
-            limit: None,
-        }),
+        CacheKey::Children { folder_id, cursor } if *folder_id > 0 => {
+            Some(NotesRequest::Children {
+                request_id,
+                folder_id: *folder_id,
+                cursor: cursor.clone(),
+                limit: None,
+            })
+        }
         CacheKey::Children { .. } => None,
-        CacheKey::Recent => Some(NotesRequest::Recent {
-            request_id,
-            limit: None,
-        }),
+        CacheKey::Recent => Some(NotesRequest::Recent { request_id, limit: None }),
     }
 }
 
@@ -382,11 +383,11 @@ fn command_request(request_id: String, command: Command) -> NotesRequest {
 }
 
 /// 答复那一格 → 缓存里那一格。投影读不出来就报位名与原话：半页画上树比空一页更难解释。
-fn project(key: CacheKey, payload: &Value) -> Result<Cached, String> {
+fn project(key: &CacheKey, payload: &Value) -> Result<Cached, String> {
     let page = match key {
-        CacheKey::Roots => node::parse_roots(payload).map(Cached::Directory),
-        CacheKey::Children { folder_id } => {
-            node::parse_children(payload, folder_id).map(Cached::Directory)
+        CacheKey::Roots { .. } => node::parse_roots(payload).map(Cached::Directory),
+        CacheKey::Children { folder_id, .. } => {
+            node::parse_children(payload, *folder_id).map(Cached::Directory)
         }
         CacheKey::Recent => node::parse_recent(payload).map(Cached::Recent),
     };
@@ -504,6 +505,19 @@ mod tests {
             self.frame(&format!("notes_{kind}"), &payload)
         }
 
+        /// 带下一页游标的那一页：翻页这一格读的就是这一形。
+        fn paged(&self, folder_id: i64, name: &str, next_cursor: &str) -> Vec<u8> {
+            let mut payload = Harness::payload_of("children", folder_id, name);
+            payload["next_cursor"] = json!(next_cursor);
+            self.frame("notes_children", &payload)
+        }
+
+        /// 把带游标的那一页落进缓存，交回这一拍的事件。
+        fn land_page(&mut self, folder_id: i64, name: &str, cursor: &str, at_ms: u64) -> Vec<LinkEvent> {
+            let frame = self.paged(folder_id, name, cursor);
+            self.read(&frame, at_ms)
+        }
+
         /// 指定命令号的一行"办成了"：号由产品自己发出去的那一行里取。
         fn frame(&self, cmd: &str, payload: &Value) -> Vec<u8> {
             let line = format!(
@@ -519,7 +533,7 @@ mod tests {
         }
 
         fn cached_name(&self, key: CacheKey) -> Option<&str> {
-            let page = self.link.cache.get(key)?;
+            let page = self.link.cache.get(&key)?;
             Some(match page {
                 Cached::Directory(page) => page.nodes.first()?.name()?,
                 Cached::Recent(page) => page.items.first()?.node.name()?,
@@ -527,8 +541,17 @@ mod tests {
         }
     }
 
+    fn roots() -> CacheKey {
+        CacheKey::Roots { cursor: None }
+    }
+
     fn children(folder_id: i64) -> CacheKey {
-        CacheKey::Children { folder_id }
+        CacheKey::Children { folder_id, cursor: None }
+    }
+
+    /// 同一夹的下一页：键只多一枚游标，格子却各占一位。
+    fn page(folder_id: i64, cursor: &str) -> CacheKey {
+        CacheKey::Children { folder_id, cursor: Some(cursor.to_string()) }
     }
 
     fn none_events() -> Vec<LinkEvent> {
@@ -539,18 +562,18 @@ mod tests {
     #[test]
     fn a_cached_page_is_never_asked_twice() {
         let mut at = Harness::new();
-        assert_eq!(at.want(CacheKey::Roots, 100), none_events());
+        assert_eq!(at.want(roots(), 100), none_events());
         assert_eq!(at.asked.len(), 1);
         assert_eq!(at.asked[0]["cmd"], json!("notes_roots"));
-        assert_eq!(at.link.read_in_flight(), Some(CacheKey::Roots));
+        assert_eq!(at.link.read_in_flight(), Some(roots()));
 
         let frame = at.page("roots", 4, "工作记录");
         let events = at.read(&frame, 200);
-        assert_eq!(events, vec![LinkEvent::PageReady(CacheKey::Roots)]);
-        assert_eq!(at.cached_name(CacheKey::Roots), Some("工作记录"));
+        assert_eq!(events, vec![LinkEvent::PageReady(roots())]);
+        assert_eq!(at.cached_name(roots()), Some("工作记录"));
         assert_eq!(at.link.read_in_flight(), None, "答复落定后那一格还占着");
 
-        assert_eq!(at.want(CacheKey::Roots, 300), none_events());
+        assert_eq!(at.want(roots(), 300), none_events());
         assert_eq!(at.asked.len(), 1, "缓存里已有的那一格被重问了一遍");
     }
 
@@ -558,12 +581,12 @@ mod tests {
     #[test]
     fn only_the_newest_page_answer_is_allowed_to_land() {
         let mut at = Harness::new();
-        at.want(CacheKey::Roots, 0);
+        at.want(roots(), 0);
         let events = at.want(children(3), 1);
         assert_eq!(
             events,
             vec![LinkEvent::PageFailed(
-                CacheKey::Roots,
+                roots(),
                 "被更近的一次展开挤掉".to_string()
             )],
             "被挤掉那一格没有报回，屏上会留一个永远转圈的槽"
@@ -615,11 +638,11 @@ mod tests {
     #[test]
     fn an_answer_only_lands_once() {
         let mut at = Harness::new();
-        at.want(CacheKey::Roots, 0);
+        at.want(roots(), 0);
         let frame = at.page("roots", 4, "甲");
         assert_eq!(
             at.read(&frame, 1),
-            vec![LinkEvent::PageReady(CacheKey::Roots)]
+            vec![LinkEvent::PageReady(roots())]
         );
 
         let twice = at.frame("notes_roots", &Harness::payload_of("roots", 9, "重发的那一页"));
@@ -627,7 +650,7 @@ mod tests {
         for stray in [twice, never] {
             assert_eq!(at.read(&stray, 2), none_events(), "同一枚号答了两次，第二次照样落了格");
         }
-        assert_eq!(at.cached_name(CacheKey::Roots), Some("甲"));
+        assert_eq!(at.cached_name(roots()), Some("甲"));
         assert_eq!(at.link.cache().len(), 1);
     }
 
@@ -638,7 +661,7 @@ mod tests {
         for (kind, at_ms) in [("roots", 1), ("children", 3), ("recent", 5)] {
             at.want(
                 match kind {
-                    "roots" => CacheKey::Roots,
+                    "roots" => roots(),
                     "children" => children(3),
                     _ => CacheKey::Recent,
                 },
@@ -661,7 +684,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            at.cached_name(CacheKey::Roots),
+            at.cached_name(roots()),
             Some("工作记录"),
             "根目录那一页跟着被清了：那一格只有文件夹"
         );
@@ -676,6 +699,104 @@ mod tests {
             at.read(b"{\"event\":\"status\",\"plugins\":[]}\n", 8),
             none_events()
         );
+    }
+
+    /// 下一页的游标是宿主交回来的那一枚，本机原样带回去；两页各占一格，问下一页不许把上一页挤掉。
+    #[test]
+    fn the_next_page_is_asked_with_the_cursor_the_host_handed() {
+        let mut at = Harness::new();
+        assert_eq!(at.want(children(7), 0), none_events());
+        assert_eq!(
+            at.land_page(7, "第一页", "abc", 1),
+            vec![LinkEvent::PageReady(children(7))]
+        );
+        let handed = at
+            .link
+            .cache()
+            .get(&children(7))
+            .and_then(Cached::as_directory)
+            .and_then(|page| page.next_cursor.clone())
+            .expect("落进缓存的那一页没带下一页的游标");
+        assert_eq!(handed, "abc");
+
+        assert_eq!(at.want(page(7, &handed), 2), none_events());
+        let sent = &at.asked[1];
+        assert_eq!(sent["cmd"], json!("notes_children"));
+        assert_eq!(sent.get("folder_id"), Some(&json!(7)));
+        assert_eq!(
+            sent.get("cursor"),
+            Some(&json!("abc")),
+            "问下一页没把宿主交来的游标带回去"
+        );
+        assert_eq!(at.link.cache().len(), 1, "问下一页把上一页挤掉了");
+
+        assert_eq!(
+            at.reply("notes_children", Harness::payload_of("children", 7, "第二页"), 3),
+            vec![LinkEvent::PageReady(page(7, "abc"))]
+        );
+        assert_eq!(at.link.cache().len(), 2, "两页没能各占一格");
+        assert_eq!(at.cached_name(children(7)), Some("第一页"));
+        assert_eq!(at.cached_name(page(7, "abc")), Some("第二页"));
+        // 已有格子的翻页不重问：同一枚游标第二次要画时一行都不发。
+        assert_eq!(at.want(page(7, "abc"), 4), none_events());
+        assert_eq!(at.asked.len(), 2);
+    }
+
+    /// 根目录那一形也带游标位：宿主给 `notes_roots` 留了翻页，键里没这一位就会两页挤成一格。
+    #[test]
+    fn a_roots_page_is_keyed_by_its_own_cursor() {
+        let mut at = Harness::new();
+        let second = CacheKey::Roots { cursor: Some("r2".to_string()) };
+        assert_eq!(at.want(second.clone(), 0), none_events());
+        assert_eq!(at.asked[0]["cmd"], json!("notes_roots"));
+        assert_eq!(at.asked[0].get("cursor"), Some(&json!("r2")));
+        assert_eq!(
+            at.reply("notes_roots", Harness::payload_of("roots", 4, "第二屏"), 1),
+            vec![LinkEvent::PageReady(second.clone())]
+        );
+        // 首次展开那一格与它无关：两格各自留着，别把首页那一格读成第二页。
+        assert_eq!(at.want(roots(), 2), none_events());
+        assert_eq!(at.asked.len(), 2);
+        assert_eq!(at.asked[1].get("cursor"), None, "首页那一格也带上了别人的游标");
+        assert_eq!(
+            at.reply("notes_roots", Harness::payload_of("roots", 9, "首页"), 3),
+            vec![LinkEvent::PageReady(roots())]
+        );
+        // 两页各自落格：一次改写都动不到别那一格。
+        assert_eq!(at.link.cache().len(), 2);
+        assert_eq!(at.cached_name(roots()), Some("首页"));
+        assert_eq!(at.cached_name(second), Some("第二屏"));
+    }
+
+    /// 变更那一发只点名文件夹、不点名第几页，所以那一夹的每一格都得走，且逐格报回给调用方。
+    #[test]
+    fn a_changed_folder_drops_every_page_it_holds() {
+        let mut at = Harness::new();
+        at.want(children(7), 0);
+        at.land_page(7, "第一页", "abc", 1);
+        at.want(page(7, "abc"), 2);
+        at.reply("notes_children", Harness::payload_of("children", 7, "第二页"), 3);
+        at.want(children(8), 4);
+        at.reply("notes_children", Harness::payload_of("children", 8, "别夹"), 5);
+        // 那一夹两页各占一格，别夹一页：三格都在。
+        assert_eq!(at.link.cache().len(), 3);
+
+        let events = at.read(
+            b"{\"event\":\"notes_changed\",\"folder\":7,\"note_id\":9,\"kind\":\"saved\"}\n",
+            6,
+        );
+        assert_eq!(
+            events,
+            vec![
+                LinkEvent::Invalidated(children(7)),
+                LinkEvent::Invalidated(page(7, "abc")),
+            ],
+            "那一夹只作废了一页"
+        );
+        assert_eq!(at.link.cache().len(), 1, "别夹那一格跟着被清了");
+        assert_eq!(at.cached_name(children(8)), Some("别夹"), "别的夹跟着被清了");
+        assert_eq!(at.cached_name(children(7)), None);
+        assert_eq!(at.cached_name(page(7, "abc")), None);
     }
 
     /// 半行等下一拍；读不出一行形状的那一行结束这条链路，剩下的行不再分派。
@@ -706,14 +827,14 @@ mod tests {
     #[test]
     fn an_expired_wait_is_reported_once_and_the_slot_opens_up() {
         let mut at = Harness::new();
-        at.want(CacheKey::Roots, 1_000);
+        at.want(roots(), 1_000);
         at.send(Command::ClearRecent, 1_000);
         assert_eq!(at.link.open_waits(), 2);
 
         assert_eq!(at.clock(1_000 + READ_TIMEOUT_MS - 1), none_events());
         assert_eq!(
             at.clock(1_000 + READ_TIMEOUT_MS),
-            vec![LinkEvent::PageFailed(CacheKey::Roots, "答复超时".to_string())]
+            vec![LinkEvent::PageFailed(roots(), "答复超时".to_string())]
         );
         assert_eq!(at.link.read_in_flight(), None, "超时后那一格还占着");
         assert_eq!(
@@ -733,7 +854,7 @@ mod tests {
     #[test]
     fn a_broken_pipe_keeps_the_last_page_and_a_reconnect_retires_the_old_ids() {
         let mut at = Harness::new();
-        at.want(CacheKey::Roots, 0);
+        at.want(roots(), 0);
         let frame = at.page("roots", 4, "工作记录");
         at.read(&frame, 1);
         at.want(children(3), 2);
@@ -766,7 +887,7 @@ mod tests {
             "断线后还有没写走的帧"
         );
         assert_eq!(
-            at.cached_name(CacheKey::Roots),
+            at.cached_name(roots()),
             Some("工作记录"),
             "断线把上次可见的页清空了"
         );

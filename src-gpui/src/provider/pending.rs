@@ -13,7 +13,7 @@ pub(crate) const READ_TIMEOUT_MS: u64 = 5_000;
 /// 写命令的等待比读长一档：宿主那侧打开文档要做真活，早一步报失败就白让用户点第二次。
 pub(crate) const COMMAND_TIMEOUT_MS: u64 = 10_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Routed {
     /// 这是一趟元数据读的答复：代次与在飞那一趟还得问 `ProviderSession`，别绕过它落缓存。
     Read(ReadTicket),
@@ -23,7 +23,7 @@ pub(crate) enum Routed {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Expired {
     Read(ReadTicket),
     Command(Command),
@@ -141,7 +141,7 @@ mod tests {
 
     fn roots_ticket() -> ReadTicket {
         ReadTicket {
-            key: CacheKey::Roots,
+            key: CacheKey::Roots { cursor: None },
             generation: 1,
         }
     }
@@ -163,11 +163,11 @@ mod tests {
             generation: 1,
         };
         let stale = pending
-            .attach_read(second.clone(), other, 1_000)
+            .attach_read(second.clone(), other.clone(), 1_000)
             .expect("后一趟没顶掉先一趟");
         assert_eq!(stale, roots_ticket());
         assert_eq!(pending.route(&first), Routed::Unknown, "被顶掉的那笔还挂着号");
-        assert_eq!(pending.route(&second), Routed::Read(other));
+        assert_eq!(pending.route(&second), Routed::Read(other.clone()));
     }
 
     /// 号只对一次：同一枚号再答一次只当不认识，不然一次翻页能落两次缓存。
@@ -177,15 +177,15 @@ mod tests {
         let read_id = pending.next_id();
         let command_id = pending.next_id();
         let ticket = ReadTicket {
-            key: CacheKey::Children { folder_id: 7 },
+            key: CacheKey::Children { folder_id: 7, cursor: None },
             generation: 3,
         };
-        assert!(pending.attach_read(read_id.clone(), ticket, 2_000).is_none());
+        assert!(pending.attach_read(read_id.clone(), ticket.clone(), 2_000).is_none());
         assert!(pending.attach_command(command_id.clone(), open(9), 4_000));
 
         assert_eq!(pending.route(&command_id), Routed::Command(open(9)));
         assert_eq!(pending.route(&command_id), Routed::Unknown);
-        assert_eq!(pending.route(&read_id), Routed::Read(ticket));
+        assert_eq!(pending.route(&read_id), Routed::Read(ticket.clone()));
         assert_eq!(pending.route(&read_id), Routed::Unknown);
         assert_eq!(pending.route("1-999"), Routed::Unknown, "没问过的号被认下了");
         assert_eq!(pending.open(), 0);
