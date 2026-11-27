@@ -3,6 +3,7 @@
 #     {plugin.json,bin/{PinGloss-Note x Nomo.exe,vcruntime140.dll},LICENSE,licenses/,SOURCE.md}
 #
 # 这一格只**组装**、不自装不发布（AGENTS：scripts/ 的产物写 `.artifacts`，绝不自动安装／打标签／发布）。
+# 用法：package-notes-plugin.ps1 [-Dev] [-SkipBuild]；-Dev 走快速 dev 编译，只组装未压缩目录树。
 # 清单 `entry.path` 仍写不带 `.exe` 的 `bin/PinGloss-Note x Nomo`：宿主 spawn.rs 2026-11-14 D-117 那一发是
 # "先试精确路径、缺失再试平台后缀"，同一份清单两平台共用，不在这里分出 Windows 副本。
 #
@@ -23,7 +24,7 @@
 # `min_host`＝宿主能转发全部七条 op 的那一下限，都住在 `scripts/packaging/notes-plugin.json`，
 # 由发布人主动改，不随 Nomo 涨版自动动。
 [CmdletBinding()]
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [switch]$Dev)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 # `$IsWindows` 是 PowerShell 7 才有的自动变量，5.1 在 StrictMode 下引用未定义变量当场炸；
@@ -78,7 +79,7 @@ function Assert-SourceState {
 }
 
 function Test-SourceRecord {
-    param([string]$Path, [string]$Target, [string]$Commit, [string]$BinarySha256,
+    param([string]$Path, [string]$Target, [string]$Profile, [string]$Commit, [string]$BinarySha256,
           [string]$Version, [switch]$SkipBuild)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "找不到产物来源记录 $Path；先不带 -SkipBuild 打包一发"
@@ -96,6 +97,12 @@ function Test-SourceRecord {
         throw '不认识的产物来源记录 schema'
     }
     if ($record.target -ne $Target) { throw "产物 target 不符：记录 $($record.target)，当前 $Target" }
+    $recordProfile = 'release'
+    if ($record.PSObject.Properties.Name -contains 'profile') {
+        if ($record.profile -isnot [string]) { throw '产物来源记录的 profile 不是字符串' }
+        $recordProfile = $record.profile
+    }
+    if ($recordProfile -cne $Profile) { throw "产物 profile 不符：记录 $recordProfile，当前 $Profile" }
     if ($record.commit -cne $Commit) { throw "产物来源 commit 不符：记录 $($record.commit)，当前 $Commit" }
     if ($record.workspace_clean -isnot [bool]) { throw '产物来源记录的 workspace_clean 不是布尔值' }
     if ($SkipBuild -and -not $record.workspace_clean) {
@@ -109,11 +116,12 @@ function Test-SourceRecord {
 }
 
 function Write-SourceRecord {
-    param([string]$Path, [string]$Target, [string]$Commit, [string[]]$Dirty,
+    param([string]$Path, [string]$Target, [string]$Profile, [string]$Commit, [string[]]$Dirty,
           [string]$BinarySha256, [string]$Version)
     $record = [ordered]@{
         schema = 1
         target = $Target
+        profile = $Profile
         commit = $Commit
         workspace_clean = ($Dirty.Count -eq 0)
         binary_sha256 = $BinarySha256
@@ -167,9 +175,15 @@ try {
     $metadata = Invoke-Captured -File 'cargo' -Arguments @('metadata', '--locked', '--no-deps', '--format-version', '1')
     if ($metadata.Exit -ne 0) { throw 'cargo metadata failed' }
     $target = 'x86_64-pc-windows-msvc'
+    $profile = if ($Dev) { 'dev' } else { 'release' }
+    $profileDirectory = if ($Dev) { 'debug' } else { 'release' }
     $targetDirectory = (($metadata.Stdout -join "`n") | ConvertFrom-Json).target_directory
-    $binary = Join-Path $targetDirectory "$target/release/nomo.exe"
-    $sourceRecord = Join-Path $targetDirectory "$target/release/nomo.notes-source.json"
+    $binary = Join-Path $targetDirectory "$target/$profileDirectory/nomo.exe"
+    $sourceRecord = Join-Path $targetDirectory "$target/$profileDirectory/nomo.notes-source.json"
+    $buildArguments = @('build', '--locked')
+    if (-not $Dev) { $buildArguments += '--release' }
+    $buildArguments += @('--target', $target, '--bin', 'nomo')
+    $buildCommand = 'cargo ' + ($buildArguments -join ' ')
     $sourceState = Get-SourceState
     $commit = $sourceState.Commit
     $dirty = $sourceState.Dirty
@@ -177,12 +191,15 @@ try {
     if ($SkipBuild -and $dirty.Count -gt 0) {
         throw '当前源码树不干净；跳过构建只允许复用干净 commit 的产物。'
     }
+    if ($Dev) {
+        Write-Output '[模式] 开发打包：dev profile 快速编译，只组装未压缩目录树，不生成 ZIP 或安装包。'
+    }
     if (-not $SkipBuild) {
-        Write-Output "[构建] cargo build --locked --release --target $target --bin nomo（首编可达十几分钟，进度落进程结束后回显）"
-        $build = Invoke-Captured -File 'cargo' -Arguments @('build', '--locked', '--release', '--target', $target, '--bin', 'nomo')
+        Write-Output "[构建] $buildCommand"
+        $build = Invoke-Captured -File 'cargo' -Arguments $buildArguments
         # cargo 的人读进度走 stderr，成功也要让终端看见这一路（闸只看退码）。
         foreach ($line in @($build.Stdout) + @($build.Stderr)) { Write-Output $line }
-        if ($build.Exit -ne 0) { throw 'Cargo release build failed' }
+        if ($build.Exit -ne 0) { throw "Cargo $profile build failed" }
         Assert-SourceState $sourceState
     }
     # Nomo 编出来的那颗就叫 `nomo.exe`；进插件树按清单 entry 补平台后缀摆成 `bin/PinGloss-Note x Nomo.exe`（内容同一颗）。
@@ -209,7 +226,7 @@ try {
 
     $binSha = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($SkipBuild) {
-        Test-SourceRecord -Path $sourceRecord -Target $target -Commit $commit -BinarySha256 $binSha `
+        Test-SourceRecord -Path $sourceRecord -Target $target -Profile $profile -Commit $commit -BinarySha256 $binSha `
             -Version $nomoVersion -SkipBuild
     }
     # 原产物通过身份与版本检查后才写来源账；随包副本只复核同一颗哈希。
@@ -225,14 +242,15 @@ try {
     Write-Output "[探针] bin/PinGloss-Note x Nomo.exe --probe 交回联名自述、退 0（Nomo 版本 $($d.version)）"
     Assert-SourceState $sourceState
     if (-not $SkipBuild) {
-        Write-SourceRecord -Path $sourceRecord -Target $target -Commit $commit -Dirty $dirty `
+        Write-SourceRecord -Path $sourceRecord -Target $target -Profile $profile -Commit $commit -Dirty $dirty `
             -BinarySha256 $binSha -Version $nomoVersion
-        Test-SourceRecord -Path $sourceRecord -Target $target -Commit $commit -BinarySha256 $binSha -Version $nomoVersion
+        Test-SourceRecord -Path $sourceRecord -Target $target -Profile $profile -Commit $commit -BinarySha256 $binSha -Version $nomoVersion
     }
 
     # ④ 组装随包树（.sh 的 install -m 644/755 在这头就是 Copy-Item；执行位是 unix 的事）。
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $stage = Join-Path $root ".artifacts/plugins/notes-$stamp"
+    $stageSuffix = if ($Dev) { '-dev' } else { '' }
+    $stage = Join-Path $root ".artifacts/plugins/notes-$stamp$stageSuffix"
     $pluginRel = 'share/pingloss/plugins/notes'
     $pluginDir = Join-Path $stage $pluginRel
     New-Item -ItemType Directory -Path (Join-Path $pluginDir 'bin') -Force | Out-Null
@@ -295,7 +313,8 @@ try {
 | 对应源码 | 下面那一枚 commit 的整棵仓库（含 src-gpui/ 源码、构建脚本、字体与图标资源） |
 | commit | $commit |
 | 源码地址 | $(if ($sourceUrl) { $sourceUrl } else { '这一份构建没有 remote 地址，按索取方式走' }) |
-| 构建命令 | cargo build --locked --release --target x86_64-pc-windows-msvc --bin nomo |
+| 构建 profile | $profile |
+| 构建命令 | $buildCommand |
 | 产物 sha256 | $binSha |
 | 打包那一下的工作区 | $workspaceState |
 | 打包时间 | $builtAt（UTC） |
@@ -380,7 +399,8 @@ corresponding source is the repository at the commit above.
     Write-Output "[许可] AGPL 原文＋五份组件许可＋SOURCE.md（commit $($commit.Substring(0,9))、sha256 现场复核）"
 
     Assert-SourceState $sourceState
-    Write-Output "Nomo notes 插件随包树: $pluginDir"
+    $outputLabel = if ($Dev) { 'Nomo notes 插件开发随包树（dev，未压缩）' } else { 'Nomo notes 插件随包树' }
+    Write-Output "${outputLabel}: $pluginDir"
 } finally {
     Pop-Location
 }

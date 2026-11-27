@@ -8,6 +8,7 @@
 #     └── licenses/            组件各自许可四份（摆法照 package-linux.sh，不在这里另造口径）
 #
 # 这一格只**组装**、不自装不发布（AGENTS：scripts/ 的产物写 `.artifacts`，绝不自动安装／打标签／发布）。
+# 用法：package-notes-plugin.sh [--dev] [--skip-build]；--dev 走快速 dev 编译，只组装未压缩目录树。
 # 宿主按清单 `entry.path` = `bin/PinGloss-Note x Nomo` 拉起这颗进程（D-D①：二进制名为联名可执行名，
 # 历史栏／待办／热键的调用方一行不改）；插件模式靠 spawn 那两位 env 判定（见
 # `src-gpui/src/plugin/endpoints.rs`），不是靠 `--mode`，所以清单用 `path` 那一形、不用 `self_mode`。
@@ -21,7 +22,8 @@
 set -euo pipefail
 
 usage() {
-  printf 'Usage: %s [--skip-build]\n' "$0"
+  printf 'Usage: %s [--dev] [--skip-build]\n' "$0"
+  printf '  --dev        快速 dev 编译，只组装未压缩插件目录树\n'
 }
 
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || {
@@ -30,9 +32,11 @@ usage() {
 }
 
 skip_build=false
+dev=false
 while (($#)); do
   case "$1" in
     --skip-build) skip_build=true ;;
+    --dev|-Dev) dev=true ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -42,8 +46,15 @@ done
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 target=x86_64-unknown-linux-gnu
+profile=release
+profile_directory=release
+if $dev; then profile=dev; profile_directory=debug; fi
 target_dir="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.target_directory')"
-source_record="$target_dir/$target/release/nomo.notes-source.json"
+source_record="$target_dir/$target/$profile_directory/nomo.notes-source.json"
+build_args=(build --locked)
+if ! $dev; then build_args+=(--release); fi
+build_args+=(--target "$target" --bin nomo)
+build_command="cargo ${build_args[*]}"
 
 read_source_state() {
   commit="$(git -C "$root" rev-parse HEAD)"
@@ -67,11 +78,11 @@ assert_source_state_unchanged() {
 }
 
 verify_source_record() {
-  python3 - "$source_record" "$target" "$commit" "$bin_sha" "$nomo_version" "$skip_build" <<'PY'
+  python3 - "$source_record" "$target" "$profile" "$commit" "$bin_sha" "$nomo_version" "$skip_build" <<'PY'
 import json, sys
 from pathlib import Path
 
-path, target, commit, bin_sha, version, skip_build = sys.argv[1:]
+path, target, profile, commit, bin_sha, version, skip_build = sys.argv[1:]
 try:
     record = json.loads(Path(path).read_text(encoding="utf-8"))
 except FileNotFoundError:
@@ -88,6 +99,11 @@ if type(record["schema"]) is not int or record["schema"] != 1:
     raise SystemExit("不认识的产物来源记录 schema")
 if record["target"] != target:
     raise SystemExit(f"产物 target 不符：记录 {record['target']}，当前 {target}")
+record_profile = record.get("profile", "release")
+if not isinstance(record_profile, str):
+    raise SystemExit("产物来源记录的 profile 不是字符串")
+if record_profile != profile:
+    raise SystemExit(f"产物 profile 不符：记录 {record_profile}，当前 {profile}")
 if record["commit"] != commit:
     raise SystemExit(f"产物来源 commit 不符：记录 {record['commit']}，当前 {commit}")
 if type(record["workspace_clean"]) is not bool:
@@ -104,15 +120,16 @@ PY
 }
 
 write_source_record() {
-  python3 - "$source_record" "$target" "$commit" "$dirty" "$bin_sha" "$nomo_version" <<'PY'
+  python3 - "$source_record" "$target" "$profile" "$commit" "$dirty" "$bin_sha" "$nomo_version" <<'PY'
 import json, os, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-path, target, commit, dirty, bin_sha, version = sys.argv[1:]
+path, target, profile, commit, dirty, bin_sha, version = sys.argv[1:]
 record = {
     "schema": 1,
     "target": target,
+    "profile": profile,
     "commit": commit,
     "workspace_clean": not dirty,
     "binary_sha256": bin_sha,
@@ -133,6 +150,9 @@ read_source_state
 if $skip_build && [[ -n "$dirty" ]]; then
   echo '当前源码树不干净；跳过构建只允许复用干净 commit 的产物。' >&2
   exit 1
+fi
+if $dev; then
+  echo '[模式] 开发打包：dev profile 快速编译，只组装未压缩目录树，不生成 ZIP、tar 或安装包。'
 fi
 
 if ! $skip_build; then
@@ -157,12 +177,12 @@ if ! $skip_build; then
         ;;
     esac
   done
-  echo "[构建] cargo build --locked --release --target $target --bin nomo"
-  cargo build --locked --release --target "$target" --bin nomo
+  echo "[构建] $build_command"
+  cargo "${build_args[@]}"
   assert_source_state_unchanged
 fi
 # Nomo 编出来的那颗就叫 `nomo`；进插件树按清单 entry 改名为 `bin/PinGloss-Note x Nomo`（内容同一颗）。
-binary="$target_dir/$target/release/nomo"
+binary="$target_dir/$target/$profile_directory/nomo"
 [[ -x "$binary" ]] || { echo "找不到产物 $binary（先不带 --skip-build 编一发）" >&2; exit 1; }
 file "$binary" | grep -q 'ELF 64-bit.*x86-64'
 if ldd "$binary" | grep 'not found'; then
@@ -191,7 +211,9 @@ if ! $skip_build; then
 fi
 
 stamp="$(date +%Y%m%d-%H%M%S)"
-stage="$root/.artifacts/plugins/notes-$stamp"
+stage_suffix=''
+if $dev; then stage_suffix='-dev'; fi
+stage="$root/.artifacts/plugins/notes-$stamp$stage_suffix"
 plugin_rel="share/pingloss/plugins/notes"
 mkdir -p "$stage/$plugin_rel/bin"
 
@@ -252,7 +274,8 @@ cat > "$stage/$plugin_rel/SOURCE.md" <<EOF
 | 对应源码 | 下面那一枚 commit 的整棵仓库（含 \`src-gpui/\` 全部源码、构建脚本、字体与图标资源） |
 | commit | \`$commit\` |
 | 源码地址 | ${source_url:-（这一份构建里没有 remote 地址，按下面"索取方式"那一条走）} |
-| 构建命令 | \`cargo build --locked --release --target $target --bin nomo\` |
+| 构建 profile | $profile |
+| 构建命令 | \`$build_command\` |
 | 产物 sha256 | \`$bin_sha\` |
 | 打包那一下的工作区 | $workspace_state |
 | 打包时间 | $built_at（UTC） |
@@ -358,4 +381,8 @@ print(f"[许可] LICENSE（AGPL 原文）＋ licenses/ 四份组件许可＋ SOU
 PY
 
 assert_source_state_unchanged
-echo "Nomo notes 插件随包树: $stage/$plugin_rel"
+if $dev; then
+  echo "Nomo notes 插件开发随包树（dev，未压缩）: $stage/$plugin_rel"
+else
+  echo "Nomo notes 插件随包树: $stage/$plugin_rel"
+fi

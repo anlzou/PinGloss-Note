@@ -82,7 +82,9 @@ cargo test --locked --release --features nomo-mark-demo --bin nomo
 
 指定 `--target` 时产物在 `target/<target>/release/`，否则在 `target/release/`。两种 feature 配置使用同一二进制名：打包脚本始终重新构建默认配置。
 
-notes 插件随包脚本 `scripts/package-notes-plugin.sh`／`scripts/package-notes-plugin.ps1` 默认重新构建默认 Release，并在产物旁写入 `nomo.notes-source.json`，记录 target、commit、构建时工作区是否干净、二进制 SHA-256、Nomo 版本和构建时间。`--skip-build`／`-SkipBuild` 只允许复用来源账完整、来源工作区干净且与当前 commit／target／二进制哈希／版本全部一致的产物；缺账、旧 commit、脏树、来源为脏树或产物被改动都会拒绝打包。首次使用这一版脚本须先正常构建一次。来源账是本地构建台账，不是签名或密码学认证；构建与打包过程复核的是 HEAD 和 `git status --porcelain` 快照，不承诺识别同一 dirty 状态下的内容替换或共享 target 的并发改写。
+notes 插件随包脚本 `scripts/package-notes-plugin.sh`／`scripts/package-notes-plugin.ps1` 默认重新构建默认 Release，并在产物旁写入 `nomo.notes-source.json`，记录 target、profile、commit、构建时工作区是否干净、二进制 SHA-256、Nomo 版本和构建时间。`--skip-build`／`-SkipBuild` 只允许复用来源账完整、来源工作区干净且与当前 commit／target／profile／二进制哈希／版本全部一致的产物；缺账、旧 commit、脏树、来源为脏树或产物被改动都会拒绝打包。首次使用这一版脚本须先正常构建一次。来源账是本地构建台账，不是签名或密码学认证；构建与打包过程复核的是 HEAD 和 `git status --porcelain` 快照，不承诺识别同一 dirty 状态下的内容替换或共享 target 的并发改写。
+
+开发环境可用 `scripts/package-notes-plugin.ps1 -Dev` 或 `scripts/package-notes-plugin.sh --dev`：使用 Cargo `dev` profile 快速编译，允许未提交源码，在 `.artifacts/plugins/notes-<时间戳>-dev/` 只组装未压缩插件目录树，不生成 ZIP、tar 或安装包。Debug 与 Release 使用各自 target 子目录和来源账；`-Dev -SkipBuild`／`--dev --skip-build` 仍要求干净源码树和匹配的 dev 来源账。开发包不用于正式发布。
 
 ### Windows x64
 
