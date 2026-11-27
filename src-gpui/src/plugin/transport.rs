@@ -153,6 +153,13 @@ fn poll_unix(
 impl Stream {
     /// 宿主侧拨进去（判据/自检里模拟宿主时才用；Nomo 作为插件走 [`Listener::accept`]）。
     pub fn connect(path: &Path, budget: Duration) -> Res<Self> {
+        Self::connect_with(path, budget, MAX_FRAME_BYTES)
+    }
+
+    /// 同上，但读侧那一格由调用方定。控制面上宿主写回的答复比数据面这一格大（宿主自家客户端也按
+    /// 更大的那一格读），拿 1 MiB 去读它的症状是合法长答复被判成对端跑飞、整条连接断开。
+    /// ⚠ 这一位只管读：写侧仍按 [`MAX_FRAME_BYTES`] 拒，那是宿主入站那一向的合同。
+    pub fn connect_with(path: &Path, budget: Duration, read_max: usize) -> Res<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::net::UnixStream;
@@ -161,7 +168,7 @@ impl Stream {
             let _ = budget; // 连接预算：非阻塞 connect 已足够；保留签名与宿主对齐。
             Ok(Stream {
                 sock,
-                framer: Framer::default(),
+                framer: Framer::with_limit(read_max),
                 write_buf: Vec::new(),
             })
         }
@@ -170,7 +177,7 @@ impl Stream {
             let pipe = windows::Stream::connect(path, budget).map_err(|e| e.to_string())?;
             Ok(Stream {
                 pipe,
-                framer: Framer::default(),
+                framer: Framer::with_limit(read_max),
             })
         }
     }
@@ -220,6 +227,19 @@ impl Stream {
     /// 发一帧（一行 + 换行）。非阻塞 socket 上的部分写用 `write_buf` 续着写完。
     pub fn send_line(&mut self, line: String) -> Res<()> {
         self.send_line_budget(line, Duration::from_secs(5))
+    }
+
+    /// 判据用：绕过 [`check_outbound_len`] 把原始字节直接写走，用来演"对端送来一帧比自家格子还大"。
+    #[cfg(test)]
+    pub fn write_raw(&mut self, bytes: &[u8]) -> Res<()> {
+        #[cfg(unix)]
+        {
+            self.sock.write_all(bytes).map_err(|e| e.to_string())
+        }
+        #[cfg(windows)]
+        {
+            self.pipe.write_raw(bytes).map_err(|e| e.to_string())
+        }
     }
 
     /// 在同一个绝对预算内发完一帧；预算也覆盖部分写与重试。
@@ -399,6 +419,119 @@ mod tests {
             "整次发送用了 {:?}，不能按每次写各等 500ms",
             started.elapsed()
         );
+    }
+
+    /// 拨号那一侧带着自己那一位读侧格子（`None`＝走 `connect` 的缺省那一格）；交回的 `reader` 是拨进来
+    /// 的那一半，`writer` 是被接住的那一半。
+    fn pair_by_dial(tag: &str, read_max: Option<usize>) -> (Stream, Stream) {
+        let name = PathBuf::from(format!(
+            r"\\.\pipe\nomo-transport-test-cap-{tag}-{}",
+            std::process::id()
+        ));
+        let mut listener = Listener::bind(&name).unwrap();
+        let reader = match read_max {
+            None => Stream::connect(&name, Duration::from_secs(5)).unwrap(),
+            Some(read_max) => Stream::connect_with(&name, Duration::from_secs(5), read_max).unwrap(),
+        };
+        let writer = loop {
+            if let Some(stream) = listener.accept().unwrap() {
+                break stream;
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        (reader, writer)
+    }
+
+    /// 轮询到那一格开口为止：Windows 的读是异步的，判据不能假定写完就读得到。
+    fn read_until_quiet(reader: &mut Stream) -> Result<Option<String>, FrameError> {
+        for _ in 0..2_500 {
+            reader.poll().expect("读侧不该报管道错");
+            match reader.next_line() {
+                Ok(None) => thread::sleep(Duration::from_millis(2)),
+                other => return other,
+            }
+        }
+        panic!("轮询到预算用完还没等到那一格的判词");
+    }
+
+    /// 往只拨了一次的格子上灌"没有换行、比 1 MiB 大"的原始字节，交出读侧的判词。
+    /// 写侧走 `write_raw` 绕开自家出站闸：宿主写回的答复不归那一位管，测的只能是读侧。
+    fn verdict_of_raw_run(
+        tag: &str,
+        read_max: Option<usize>,
+        blob: &[u8],
+    ) -> Result<Option<String>, FrameError> {
+        let (mut reader, writer) = pair_by_dial(tag, read_max);
+        let sent = blob.to_vec();
+        let pump = thread::spawn(move || {
+            let mut writer = writer;
+            let _ = writer.write_raw(&sent);
+        });
+        let verdict = read_until_quiet(&mut reader);
+        // 先收读者：写侧那一路还在灌，管子断了它才立刻收尾，不然判据要等满写预算。
+        drop(reader);
+        pump.join().unwrap();
+        verdict
+    }
+
+    #[test]
+    fn a_dialed_connection_reads_with_the_cap_it_was_handed() {
+        // 同一串线上字节，格子给 16：整帧到齐也照样判跑飞——报的是这一只自己的数。
+        let (mut reader, mut writer) = pair_by_dial("narrow", Some(16));
+        writer.send_line("x".repeat(64)).unwrap();
+        assert_eq!(
+            read_until_quiet(&mut reader),
+            Err(FrameError::TooLong {
+                got: 64,
+                limit: 16
+            }),
+            "读侧没用自己那一格"
+        );
+
+        // 顶上那一格刚好够用，同一发就该完整交回来。
+        let (mut ok_reader, mut ok_writer) = pair_by_dial("exact", Some(64));
+        ok_writer.send_line("y".repeat(64)).unwrap();
+        assert_eq!(
+            read_until_quiet(&mut ok_reader).unwrap(),
+            Some("y".repeat(64)),
+            "刚好到格的帧不该被拒"
+        );
+    }
+
+    #[test]
+    fn a_wider_dial_keeps_a_frame_the_default_cap_would_refuse() {
+        // 同一串没有换行的原始字节，比 1 MiB 大一点：缺省那一格与点名 1 MiB 的那一格都判跑飞。
+        // 换构造写法时若把缺省那一格悄悄跟着放宽，头一臂就红。
+        let blob = vec![b'z'; MAX_FRAME_BYTES + 4_096];
+        for (tag, read_max) in [
+            ("default-dial", None),
+            ("one-mebibyte", Some(MAX_FRAME_BYTES)),
+        ] {
+            match verdict_of_raw_run(tag, read_max, &blob) {
+                Err(FrameError::TooLong { got, limit }) => {
+                    assert_eq!(limit, MAX_FRAME_BYTES, "{tag} 报的格子不是数据面那一格");
+                    assert!(
+                        got > limit,
+                        "{tag} 没换行的那一段还没越过格子就判死了：{got}"
+                    );
+                }
+                other => panic!("{tag} 该判这串字节跑飞，实际 {other:?}"),
+            }
+        }
+
+        // 宽到 4 MiB 的那一格：同样的字节只当还没收完，换行到齐交出整帧。
+        let (mut roomy, writer) = pair_by_dial("roomy", Some(4 << 20));
+        let sent = blob.clone();
+        let pump = thread::spawn(move || {
+            let mut writer = writer;
+            writer.write_raw(&sent).unwrap();
+            writer.write_raw(b"\n").unwrap();
+        });
+        let line = read_until_quiet(&mut roomy)
+            .expect("宽格子不该把合法长帧判死")
+            .expect("换行到齐就该交出整帧");
+        assert_eq!(line.len(), blob.len(), "交回来的不是完整那一帧");
+        pump.join().unwrap();
     }
 
     #[test]
