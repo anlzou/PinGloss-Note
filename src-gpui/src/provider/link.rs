@@ -98,8 +98,8 @@ impl Link {
         self.pending.open()
     }
 
-    /// 取走要写进管道的那些行（含结尾换行）。取走即清：写一半断了由调用方决定剩下几行怎么办——
-    /// 那些行对应的命令已记在 `pending` 上，最终由超时或断线逐条报回，不会静默消失。
+    /// 取走要写进管道的那些**帧体**（不含帧尾换行，那一个由管子补）。取走即清：写一半断了由调用方
+    /// 决定剩下几行怎么办——那些行对应的命令已记在 `pending` 上，最终由超时或断线逐条报回，不会静默消失。
     pub(crate) fn take_outbound(&mut self) -> Vec<String> {
         std::mem::take(&mut self.outbound)
     }
@@ -141,7 +141,7 @@ impl Link {
         if let Some(key) = squeezed_out.or_else(|| stale.map(|stale| stale.key)) {
             events.push(LinkEvent::PageFailed(key, "被更近的一次展开挤掉".to_string()));
         }
-        self.outbound.push(line);
+        self.outbound.push(frame_body(line));
         events
     }
 
@@ -336,9 +336,15 @@ impl Link {
                 command,
                 now_ms + COMMAND_TIMEOUT_MS,
             );
-            self.outbound.push(line);
+            self.outbound.push(frame_body(line));
         }
     }
+}
+
+/// 攒在门口的是帧体：`to_line` 按宿主的合同连着帧尾换行一起交，而写那一侧（`transport::Stream` 的
+/// `send_line`）自己补那一个。两处都补就对端就是两条帧，第二条空得连形状都读不出来。
+fn frame_body(line: String) -> String {
+    line[..line.len() - 1].to_string()
 }
 
 /// 那一格要问的那一行。`Children{0}` 是宿主整行拒收的形状，在这里就地拦下。

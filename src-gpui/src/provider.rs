@@ -8,7 +8,8 @@
 //! 这几件事各住一处：控制面的帧形与落点住在 `provider::control`，答复到目录节点的投影住在
 //! `provider::node`，一屏留多少页住在 `provider::cache`，哪一趟答复还作数住在 `provider::session`，
 //! 号与来路的对应住在 `provider::pending`，把这四层串成"问一格、收一行、报一事"的泵住在
-//! `provider::link`；拨号与写字节的那根线程还没有，provider 目标仍无生产来路。
+//! `provider::link`，拨号、发帧与按预算收行那一根管子住在 `provider::pipe`；驱动它的那根线程还没有，
+//! provider 目标仍无生产来路。
 use std::path::PathBuf;
 
 #[allow(dead_code)] // 接线之前，端点推导与分诊表只有测试在读。
@@ -23,6 +24,8 @@ pub(crate) mod session;
 pub(crate) mod pending;
 #[allow(dead_code)] // 同上：泵的两头（句柄与屏）都还没接，进出两侧只有测试在喂。
 pub(crate) mod link;
+#[allow(dead_code)] // 同上：管子已经能拨通，但没有那根线程去走每一拍。
+pub(crate) mod pipe;
 
 /// `item_id` 的长度上限：它既当缓存键，也要原样进控制帧，超界的那条按坏值拒收而不是截断。
 const MAX_ITEM_BYTES: usize = 512;
