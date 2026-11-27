@@ -49,7 +49,7 @@ impl CacheKey {
 }
 
 /// 存下来的那一格。两种形状共用一枚 enum，字节账因此只有一处。
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum Cached {
     Directory(Page),
     Recent(RecentPage),
@@ -98,11 +98,12 @@ fn cursor_bytes(cursor: &Option<String>) -> usize {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct ProviderCache {
     /// 队首是最先写进来的那一位，也就是最先被赶走的那一位。
     entries: Vec<(CacheKey, Cached)>,
     bytes: usize,
+    revision: u64,
 }
 
 impl ProviderCache {
@@ -112,6 +113,10 @@ impl ProviderCache {
 
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub(crate) fn get(&self, key: &CacheKey) -> Option<&Cached> {
@@ -129,12 +134,16 @@ impl ProviderCache {
         self.entries.push((key.clone(), page));
         self.bytes += cost;
         self.trim();
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
     pub(crate) fn invalidate(&mut self, key: &CacheKey) -> bool {
         let had = self.get(key).is_some();
         self.drop(key);
+        if had {
+            self.revision = self.revision.wrapping_add(1);
+        }
         had
     }
 
@@ -150,12 +159,19 @@ impl ProviderCache {
         for key in &dropped {
             self.drop(key);
         }
+        if !dropped.is_empty() {
+            self.revision = self.revision.wrapping_add(1);
+        }
         dropped
     }
 
     pub(crate) fn clear(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
         self.entries.clear();
         self.bytes = 0;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     fn drop(&mut self, key: &CacheKey) {
@@ -267,6 +283,40 @@ mod tests {
         assert_eq!((cache.len(), cache.bytes()), before, "留不下的那一格动了别人");
         assert!(cache.get(&folder(7)).is_none());
         assert!(cache.get(&roots()).is_some(), "已有目录被一次失败翻页清空");
+    }
+
+    #[test]
+    fn the_revision_moves_only_when_the_cache_really_changes() {
+        let mut cache = ProviderCache::default();
+        assert_eq!(cache.revision(), 0);
+        assert!(!cache.invalidate(&folder(9)));
+        assert!(cache.invalidate_folder(9).is_empty());
+        cache.clear();
+        assert_eq!(cache.revision(), 0, "空账上的无效操作不该唤醒屏");
+
+        assert!(cache.insert(&folder(1), directory(vec![])));
+        assert_eq!(cache.revision(), 1);
+        assert!(!cache.insert(
+            &folder(2),
+            directory(vec![note(9, 2, &"x".repeat(MAX_CACHE_BYTES + (1 << 16)))])
+        ));
+        assert_eq!(cache.revision(), 1, "存不下的那一格不该报成变化");
+        assert!(cache.invalidate(&folder(1)));
+        assert_eq!(cache.revision(), 2);
+        assert!(!cache.invalidate(&folder(1)));
+        assert_eq!(cache.revision(), 2, "重复作废不该再报一次变化");
+
+        assert!(cache.insert(&folder(3), directory(vec![])));
+        assert!(cache.insert(&folder(4), directory(vec![])));
+        let before = cache.revision();
+        assert_eq!(cache.invalidate_folder(3), vec![folder(3)]);
+        assert_eq!(cache.revision(), before + 1);
+        assert!(cache.invalidate_folder(3).is_empty());
+        assert_eq!(cache.revision(), before + 1);
+        cache.clear();
+        assert_eq!(cache.revision(), before + 2);
+        cache.clear();
+        assert_eq!(cache.revision(), before + 2, "重复清空不该再报一次变化");
     }
 
     /// 同键重写：值换新的、条数不双计，且这一枚挪到队尾——刚翻页看到的目录下一轮就被赶走是不合理的。

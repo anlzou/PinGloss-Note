@@ -75,6 +75,10 @@ impl Link {
         &self.cache
     }
 
+    pub(crate) fn cache_revision(&self) -> u64 {
+        self.cache.revision()
+    }
+
     pub(crate) fn is_online(&self) -> bool {
         self.session.is_online()
     }

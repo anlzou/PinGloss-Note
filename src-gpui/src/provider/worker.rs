@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 
-use super::cache::CacheKey;
+use super::cache::{CacheKey, ProviderCache};
 use super::link::{Link, LinkEvent};
 use super::pipe::Pipe;
 use super::session::Command;
@@ -29,11 +30,20 @@ const DIAL_BUDGET: Duration = Duration::from_secs(2);
 const WRITE_BUDGET: Duration = Duration::from_secs(2);
 
 /// 屏递进线程的一桩事。`Shutdown` 走通道而不是只靠句柄析构，线程才能在预算内把手上的管子放下。
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Intent {
     Page(CacheKey),
     Command(Command),
     Retry,
     Shutdown,
+}
+
+/// 线程侧发布的一版快照：缓存只在这一处复制，屏那侧共享同一枚 `Arc`。
+#[derive(Clone, Debug)]
+pub(crate) struct WorkerSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) online: bool,
+    pub(crate) cache: Arc<ProviderCache>,
 }
 
 /// 线程上那台状态机：一条链路、至多一根管子、两把拨号与写字节的那把尺。
@@ -68,6 +78,26 @@ impl Pump {
 
     pub(crate) fn link(&self) -> &Link {
         &self.link
+    }
+
+    pub(crate) fn snapshot(&self) -> WorkerSnapshot {
+        WorkerSnapshot {
+            generation: self.link.generation(),
+            online: self.connected(),
+            cache: Arc::new(self.link.cache().clone()),
+        }
+    }
+
+    fn connected(&self) -> bool {
+        self.pipe.is_some() && self.link.is_online()
+    }
+
+    fn state(&self) -> (u64, bool, u64) {
+        (
+            self.link.generation(),
+            self.connected(),
+            self.link.cache_revision(),
+        )
     }
 
     /// 这一拍不可能有任何事：没管子、没问出去的东西、也没排着的命令。线程据此决定睡多久。
@@ -130,6 +160,7 @@ impl Pump {
 pub(crate) struct Worker {
     intents: SyncSender<Intent>,
     events: Receiver<LinkEvent>,
+    snapshots: watch::Receiver<WorkerSnapshot>,
     thread: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
 }
@@ -138,18 +169,20 @@ impl Worker {
     pub(crate) fn start(pump: Pump) -> Result<Self, String> {
         let (intents, incoming) = mpsc::sync_channel(INTENT_QUEUE);
         let (reports, events) = mpsc::channel();
+        let (snapshot_reports, snapshots) = watch::channel(pump.snapshot());
         let running = Arc::new(AtomicBool::new(true));
         let flag = running.clone();
         let thread = thread::Builder::new()
             .name("nomo-provider".to_string())
             .spawn(move || {
-                run(pump, incoming, reports);
+                run(pump, incoming, reports, snapshot_reports);
                 flag.store(false, Ordering::Release);
             })
             .map_err(|err| format!("provider 线程起不来：{err}"))?;
         Ok(Self {
             intents,
             events,
+            snapshots,
             thread: Some(thread),
             running,
         })
@@ -168,6 +201,14 @@ impl Worker {
     /// 取走线程报回来的事件，不阻塞：屏每一帧叫一次，攒够再画。
     pub(crate) fn take_events(&self) -> Vec<LinkEvent> {
         self.events.try_iter().collect()
+    }
+
+    pub(crate) fn take_snapshot(&mut self) -> WorkerSnapshot {
+        self.snapshots.borrow_and_update().clone()
+    }
+
+    pub(crate) fn snapshot_watch(&self) -> watch::Receiver<WorkerSnapshot> {
+        self.snapshots.clone()
     }
 
     /// 线程还在不在跑。收尾路径的判据就落在这位上。
@@ -206,9 +247,15 @@ impl Drop for Worker {
 
 /// 线程本体：一次把门口攒的意图吃光（滚动一下能问出几十格，逐条走拍会把同一目录问成一串往返），
 /// 再走一拍，最后把事件送出去——收不到就代表屏那侧不要了，线程随之收手。
-fn run(mut pump: Pump, incoming: Receiver<Intent>, reports: Sender<LinkEvent>) {
+fn run(
+    mut pump: Pump,
+    incoming: Receiver<Intent>,
+    reports: Sender<LinkEvent>,
+    snapshot_reports: watch::Sender<WorkerSnapshot>,
+) {
     loop {
         let beat = if pump.idle() { IDLE_BEAT } else { BEAT };
+        let before = pump.state();
         let mut batch = Vec::new();
         match incoming.recv_timeout(beat) {
             Ok(first) => {
@@ -232,10 +279,14 @@ fn run(mut pump: Pump, incoming: Receiver<Intent>, reports: Sender<LinkEvent>) {
             reported.extend(pump.apply(intent, now_ms));
         }
         reported.extend(pump.beat(now_ms));
+        let changed = before != pump.state() || !reported.is_empty();
         for event in reported {
             if reports.send(event).is_err() {
                 return;
             }
+        }
+        if changed && snapshot_reports.send(pump.snapshot()).is_err() {
+            return;
         }
     }
 }
@@ -307,14 +358,48 @@ mod offline_tests {
         );
     }
 
+    #[test]
+    fn a_worker_publishes_the_offline_state_after_the_failed_wait() {
+        let pump = Pump::at(
+            Some(nowhere()),
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+        );
+        let mut worker = Worker::start(pump).expect("测试线程起得来");
+        let watch = worker.snapshot_watch();
+        assert!(!watch.borrow().online, "还没拨号不该报在线");
+        let key = CacheKey::Roots { cursor: None };
+        worker.ask(Intent::Page(key.clone())).expect("意图递得进去");
+        for _ in 0..250 {
+            if watch.has_changed().unwrap_or(true) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(watch.has_changed().unwrap_or(false), "线程没发布离线快照");
+        let snapshot = worker.take_snapshot();
+        assert!(!snapshot.online, "拨不通之后快照仍写在线");
+        assert!(matches!(
+            worker.take_events().as_slice(),
+            [LinkEvent::PageFailed(asked, _)] if *asked == key
+        ));
+        assert!(worker.shutdown(Duration::from_secs(2)));
+    }
+
     /// 队列到顶就把原物交回，让调用方这一拍放弃；线程只处理已经收下的意图。
     #[test]
     fn a_full_intent_queue_hands_the_same_intent_back() {
         let (intents, _incoming) = mpsc::sync_channel(INTENT_QUEUE);
         let (_reports, events) = mpsc::channel();
+        let (_snapshot_reports, snapshots) = watch::channel(WorkerSnapshot {
+            generation: 1,
+            online: false,
+            cache: Arc::new(ProviderCache::default()),
+        });
         let worker = Worker {
             intents,
             events,
+            snapshots,
             thread: None,
             running: Arc::new(AtomicBool::new(false)),
         };
@@ -442,6 +527,35 @@ mod tests {
             "到齐的那一行没被交回链路"
         );
         assert_eq!(pump.link().cache().len(), 1, "报回 PageReady 却没留那一格");
+    }
+
+    /// 快照的在线位跟着真管子走，断线后上次读到的目录仍留在缓存里。
+    #[test]
+    fn a_snapshot_tracks_the_pipe_and_keeps_the_last_visible_cache() {
+        let name = endpoint("snapshot");
+        let mut listener = Listener::bind(&name).expect("绑不上测试管子");
+        let mut pump = pump_at(&name);
+        pump.apply(Intent::Page(roots()), 1);
+        pump.beat(2);
+        let mut host = accept(&mut listener);
+        let request_id = id_of(&drain(&mut host)[0]);
+        host.send_line(roots_reply(&request_id))
+            .expect("答复写不走");
+        assert_eq!(pump.beat(3), vec![LinkEvent::PageReady(roots())]);
+
+        let online = pump.snapshot();
+        assert!(online.online, "管子还在却不报在线");
+        assert_eq!(online.cache.len(), 1, "报回 ready 却没把目录放进快照");
+        drop(host);
+        pump.beat(4);
+
+        let offline = pump.snapshot();
+        assert!(!offline.online, "管子断了快照还写在线");
+        assert_eq!(offline.cache.len(), 1, "断线把上次可见目录清了");
+        assert!(
+            offline.cache.get(&roots()).is_some(),
+            "断线后读不到上次那一页"
+        );
     }
 
     /// 对端收掉之后只有"重试"能再拨：断线自动重拨会把宿主没跑的时候问成后台循环。

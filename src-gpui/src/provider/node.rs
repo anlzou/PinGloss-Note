@@ -113,20 +113,20 @@ impl ProviderNode {
 }
 
 /// 一页目录：节点加那一枚"还有下一段"的游标。
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Page {
     pub(crate) nodes: Vec<ProviderNode>,
     pub(crate) next_cursor: Option<String>,
 }
 
 /// 首页最近项目的一条：节点本体加宿主账本里那次真实打开时间。
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RecentEntry {
     pub(crate) node: ProviderNode,
     pub(crate) opened_at_ms: i64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RecentPage {
     pub(crate) as_of_ms: i64,
     pub(crate) items: Vec<RecentEntry>,

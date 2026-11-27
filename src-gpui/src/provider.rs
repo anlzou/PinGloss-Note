@@ -9,7 +9,8 @@
 //! `provider::node`，一屏留多少页住在 `provider::cache`，哪一趟答复还作数住在 `provider::session`，
 //! 号与来路的对应住在 `provider::pending`，把这四层串成"问一格、收一行、报一事"的泵住在
 //! `provider::link`，拨号、发帧与按预算收行那一根管子住在 `provider::pipe`，把管子搬到线程上、
-//! 只让屏递意图收事件的通道住在 `provider::worker`；屏侧那份快照还没有，provider 目标仍到不了屏。
+//! 只让屏递意图收事件的通道住在 `provider::worker`；屏侧只读快照与订阅住在 `provider::snapshot`，
+//! 文件树与首页还没来接，provider 目标仍到不了屏。
 use std::path::PathBuf;
 
 #[allow(dead_code)] // 接线之前，端点推导与分诊表只有测试在读。
@@ -26,8 +27,10 @@ pub(crate) mod pending;
 pub(crate) mod link;
 #[allow(dead_code)] // 同上：管子已经能拨通，但没有屏那一侧的读者去递意图。
 pub(crate) mod pipe;
-#[allow(dead_code)] // 同上：线程与通道两头都在测试里走，快照还没人来订阅。
+#[allow(dead_code)] // 同上：线程已经能拨号回信，文件树与首页还没来递意图。
 pub(crate) mod worker;
+#[allow(dead_code)] // 快照与订阅已备好，文件树与首页还没来读。
+pub(crate) mod snapshot;
 
 /// `item_id` 的长度上限：它既当缓存键，也要原样进控制帧，超界的那条按坏值拒收而不是截断。
 const MAX_ITEM_BYTES: usize = 512;

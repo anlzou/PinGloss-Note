@@ -73,7 +73,17 @@ impl Pipe {
         }
         loop {
             match stream.next_line() {
-                Ok(Some(line)) => events.extend(link.ingest_line(&line, now_ms)),
+                Ok(Some(line)) => {
+                    let ingested = link.ingest_line(&line, now_ms);
+                    if let Some(LinkEvent::Broken(reason)) =
+                        ingested.iter().find(|event| matches!(event, LinkEvent::Broken(_)))
+                    {
+                        let reason = reason.clone();
+                        events.extend(ingested);
+                        return broken(link, &reason, events);
+                    }
+                    events.extend(ingested);
+                }
                 Ok(None) => break,
                 Err(err) => {
                     return broken(link, &format!("那一帧读不通：{err:?}"), events);
@@ -215,6 +225,34 @@ mod tests {
         );
         assert_eq!(link.cache().len(), 1, "报回 PageReady 却没留那一格");
         assert_eq!(link.open_waits(), 0, "答复落定后那一格还占着");
+    }
+
+    /// 坏帧不是普通事件：管子当场落下，在飞的那一格也要报回，不能留着在线位空转。
+    #[test]
+    fn a_malformed_line_retires_the_pipe_and_reports_the_open_wait() {
+        let (mut pipe, mut host) = pair("malformed");
+        let mut link = Link::new();
+        link.want_page(roots(), 0);
+        pipe.drive(&mut link, 1);
+        drain(&mut host);
+        host.send_line("not-json".to_string()).expect("坏帧写不走");
+
+        let events = drive_until(&mut pipe, &mut link, 2);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, LinkEvent::Broken(_))),
+            "坏帧没报 Broken：{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, LinkEvent::PageFailed(key, _) if *key == roots())),
+            "坏帧收摊却没还那一格：{events:?}"
+        );
+        assert!(!pipe.is_alive(), "坏帧之后管子还在");
+        assert!(!link.is_online(), "坏帧之后链路还写在线");
+        assert!(pipe.drive(&mut link, 3).is_empty(), "落下的管子又走了一拍");
     }
 
     /// 超过数据面那一格的合法答复要整帧落地：读侧那一格是控制面的宽尺，不是 1 MiB。
