@@ -95,6 +95,8 @@ mod tests {
         f.push(b"world\n");
         assert_eq!(f.next_line(), Ok(Some("hello world".to_string())));
         assert_eq!(f.next_line(), Ok(None), "取完就空");
+        f.push(b"");
+        assert_eq!(f.next_line(), Ok(None), "空读不该造出空行");
     }
 
     #[test]

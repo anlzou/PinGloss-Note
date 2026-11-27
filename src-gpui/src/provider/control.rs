@@ -286,35 +286,6 @@ pub(crate) fn triage(line: &str) -> Triage {
     }
 }
 
-/// 攒行的那一半：把刚读到的字节并进缓冲，交出已经完整的那些行。
-///
-/// 不复用数据面的 `plugin::frame::Framer`，因为那一把尺硬钉 1 MiB，而控制面的答复可以到
-/// [`REPLY_MAX_BYTES`]——同一条命令的两个方向不能共用一个数。
-#[derive(Default, Debug)]
-pub(crate) struct ReplyLines {
-    buffer: Vec<u8>,
-}
-
-impl ReplyLines {
-    /// `None`＝这一行已经不可能合法（超出答复上限还没等到换行），调用方据此收掉这条连接。
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Option<Vec<String>> {
-        self.buffer.extend_from_slice(bytes);
-        if self.buffer.len() > REPLY_MAX_BYTES {
-            return None;
-        }
-        let mut lines = Vec::new();
-        while let Some(at) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let raw: Vec<u8> = self.buffer.drain(..at).collect();
-            self.buffer.drain(..1);
-            // 不是 UTF-8 的一行不可能是合法 JSON Lines，triage 也读不出形状，就地收掉。
-            if let Ok(line) = String::from_utf8(raw) {
-                lines.push(line);
-            }
-        }
-        Some(lines)
-    }
-}
-
 /// 覆盖值：非空就原样用。空串在宿主那一侧是报错而不是"回落默认"，这里同一口径——
 /// "我明明设了却没生效"最省钱的读法就是当场报出来。
 pub(crate) fn override_endpoint(raw: &OsStr) -> Result<PathBuf, EndpointError> {
@@ -866,47 +837,12 @@ mod tests {
         }
     }
 
-    /// 答复那把尺比请求那把宽四倍：把 1 MiB 当读回上限，合法长答复会被当成对端跑飞。
+    /// 读侧那一格与宿主自家客户端同值，且比宿主**入站**那一向宽一档：拿 1 MiB 去读控制面，合法长答复
+    /// 会被判成对端跑飞。攒行与越界的实况由 `plugin::frame`、`plugin::transport` 各测一次。
     #[test]
-    fn a_long_answer_still_arrives_as_one_line() {
-        let title = "x".repeat(2 << 20);
-        let line =
-            format!(r#"{{"ok":true,"payload":{{"title":"{title}"}},"request_id":"r"}}"#) + "\n";
-        assert!(line.len() > (2 << 20) && line.len() < REPLY_MAX_BYTES);
-        let mut reader = ReplyLines::default();
-        let half = line.len() / 2;
-        assert_eq!(
-            reader.push(line[..half].as_bytes()),
-            Some(Vec::new()),
-            "没等到换行就交行会把一条答复切成两条"
-        );
-        let lines = reader
-            .push(line[half..].as_bytes())
-            .expect("后半拍带着换行，仍然合法");
-        assert_eq!(lines.len(), 1);
-        assert!(matches!(triage(&lines[0]), Triage::Answer { .. }));
-        assert!(reader.push(b"").unwrap().is_empty(), "空读不该造出空行");
-    }
-
-    #[test]
-    fn two_replies_in_one_read_come_out_in_order() {
-        let mut reader = ReplyLines::default();
-        let lines = reader
-            .push(b"{\"ok\":true,\"payload\":{\"n\":1},\"request_id\":\"a\"}\n{\"ok\":true,\"payload\":{\"n\":2},\"request_id\":\"b\"}\n")
-            .expect("两行都在上限内");
-        assert_eq!(
-            lines.iter().map(|line| line.contains("\"b\"")).collect::<Vec<_>>(),
-            vec![false, true]
-        );
-    }
-
-    #[test]
-    fn a_runaway_line_is_reported_not_buffered_forever() {
-        let mut reader = ReplyLines::default();
-        // 两拍各 3 MiB：第一拍只是"还没收完"，第二拍越界才该收掉这条连接。
-        assert!(reader.push(&vec![b'x'; 3 << 20]).is_some());
-        assert_eq!(reader.push(&vec![b'y'; 2 << 20]), None);
+    fn the_reply_cap_is_wider_than_the_frame_the_host_reads() {
         assert_eq!(REPLY_MAX_BYTES, 4 << 20);
+        assert!(REPLY_MAX_BYTES > crate::plugin::frame::MAX_FRAME_BYTES);
     }
 
     /// 六位命令名是本模块拼行的那一份出处：名单漂一位，症状是宿主整行拒收而屏上只显示离线。

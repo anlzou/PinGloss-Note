@@ -1,18 +1,19 @@
 //! 五层串成一条链路：问一格、发一帧、按号找回落点、把结果交回调用方。
 //!
-//! 这里不拨号、不握句柄，也不写字节——那一截归 `provider` 之外的工作线程。本模块是一台**字节进、
-//! 事件出**的泵：进来的字节交给 `control::ReplyLines` 攒行，每一行按 `pending` 的号找回当初问的是
+//! 这里不拨号、不握句柄，也不写字节——那一截归管子那一层。本模块是一台**整行进、事件出**的泵：
+//! 交进来的每一行已经是完整的一帧（攒行与帧上限归 `plugin::frame::Framer`，读侧那一格由
+//! `plugin::transport::Stream::connect_with` 递给控制面），每一行按 `pending` 的号找回当初问的是
 //! 哪一格，再由 `session` 裁定这趟还作不作数、`node` 投影、`cache` 留页。为什么要中间这一层：判断
 //! 直接写进线程的话，"答复落错格子""断线丢命令"这两类病只能在真机上复现；抽出来之后每件事都能
 //! 当场对账。事件只说发生了什么，缓存是唯一事实出处，调用方读 `cache()` 取页——一份状态不会两头漂。
 //!
-//! `Link` 也不持句柄，因而是单线程使用的状态机；工作线程把读到的字节送进来、把要写的字节取走。
+//! `Link` 也不持句柄，因而是单线程使用的状态机；工作线程把读到的整行送进来、把要写的整行取走。
 //! 翻页那一格住在 `CacheKey` 上：目录两形各带一位游标，`None` 是首次展开，下一页的游标由调用方从缓存里
 //! 那一页的 `next_cursor` 取来。⚠ 游标对 Nomo 不透明，只原样带回宿主，不解析也不进日志。
 use serde_json::Value;
 
 use super::cache::{CacheKey, Cached, ProviderCache};
-use super::control::{NotesRequest, ReplyLines, Triage, triage};
+use super::control::{NotesRequest, Triage, triage};
 use super::node;
 use super::pending::{COMMAND_TIMEOUT_MS, Expired, Pending, READ_TIMEOUT_MS, Routed};
 use super::session::{Begin, Command, Enqueue, MAX_QUEUED_COMMANDS, ProviderSession, Settle};
@@ -41,13 +42,12 @@ pub(crate) enum LinkEvent {
     Broken(String),
 }
 
-/// 一条链路的状态：调度、号账、缓存、攒行的缓冲，加上等着写进管道的那些行。
+/// 一条链路的状态：调度、号账、缓存，加上等着写进管道的那些行。
 #[derive(Debug)]
 pub(crate) struct Link {
     session: ProviderSession,
     pending: Pending,
     cache: ProviderCache,
-    reader: ReplyLines,
     outbound: Vec<String>,
 }
 
@@ -67,7 +67,6 @@ impl Link {
             session,
             pending,
             cache: ProviderCache::default(),
-            reader: ReplyLines::default(),
             outbound: Vec::new(),
         }
     }
@@ -169,33 +168,26 @@ impl Link {
         events
     }
 
-    /// 喂进来的那一段字节。返回的事件按字节顺序排；一旦判读不通就当场收束，剩下几行不再分派。
-    pub(crate) fn ingest(&mut self, bytes: &[u8], now_ms: u64) -> Vec<LinkEvent> {
+    /// 喂进来的那一整行——行尾的换行由管子那一层的帧器去掉，这里只认完整的一帧。
+    /// 读不出形状就当场收束：连接去留归握句柄的那一层判，这一层不猜。
+    pub(crate) fn ingest_line(&mut self, line: &str, now_ms: u64) -> Vec<LinkEvent> {
         let mut events = Vec::new();
-        let Some(lines) = self.reader.push(bytes) else {
-            events.push(LinkEvent::Broken(
-                "答复那一行超出自家上限，等不到换行了".to_string(),
-            ));
-            return events;
-        };
-        for line in lines {
-            match triage(&line) {
-                Triage::Answer { request_id, payload } => {
-                    self.land(request_id, payload, &mut events)
-                }
-                Triage::Refused {
-                    request_id,
-                    field,
-                    code,
-                    message,
-                } => self.refuse(request_id, format!("{message}（宿主报 {field}／{code}）"), &mut events),
-                Triage::Announce { event, folder, kind } => {
-                    self.announce(&event, folder, kind.as_deref(), &mut events)
-                }
-                Triage::Garbage(reason) => {
-                    events.push(LinkEvent::Broken(reason.to_string()));
-                    return events;
-                }
+        match triage(line) {
+            Triage::Answer { request_id, payload } => {
+                self.land(request_id, payload, &mut events)
+            }
+            Triage::Refused {
+                request_id,
+                field,
+                code,
+                message,
+            } => self.refuse(request_id, format!("{message}（宿主报 {field}／{code}）"), &mut events),
+            Triage::Announce { event, folder, kind } => {
+                self.announce(&event, folder, kind.as_deref(), &mut events)
+            }
+            Triage::Garbage(reason) => {
+                events.push(LinkEvent::Broken(reason.to_string()));
+                return events;
             }
         }
         // 答复腾出的格子用来发排着的命令：除重连外，这是命令队唯一的推进时机。
@@ -243,12 +235,12 @@ impl Link {
         events
     }
 
-    /// 重连：起新一代并撤净旧号，攒行的缓冲也整段丢掉——半行旧字节会把新连接的第一行读坏。
+    /// 重连：起新一代并撤净旧号，没写走的帧整排丢掉——旧连接的帧塞进新管道，只会让新连接的第一行
+    /// 读成一条没问过的答复。半行旧字节不在这里管：新管子自带一只新帧器。
     /// 重问哪几格由调用方决定：重连后旧连接上晚到的答复只会交 `Unknown`，所以留着缓存不会说谎。
     pub(crate) fn reconnect(&mut self) -> u64 {
         let generation = self.session.reconnect();
         self.pending.reset_connection(generation);
-        self.reader = ReplyLines::default();
         self.outbound.clear();
         generation
     }
@@ -445,8 +437,8 @@ mod tests {
             self.collect(events)
         }
 
-        fn read(&mut self, bytes: &[u8], at: u64) -> Vec<LinkEvent> {
-            let events = self.link.ingest(bytes, at);
+        fn read(&mut self, line: &str, at: u64) -> Vec<LinkEvent> {
+            let events = self.link.ingest_line(line, at);
             self.collect(events)
         }
 
@@ -500,13 +492,13 @@ mod tests {
         }
 
         /// 三种页各一份逐字照宿主 `to_value` 的答复帧。
-        fn page(&self, kind: &str, folder_id: i64, name: &str) -> Vec<u8> {
+        fn page(&self, kind: &str, folder_id: i64, name: &str) -> String {
             let payload = Harness::payload_of(kind, folder_id, name);
             self.frame(&format!("notes_{kind}"), &payload)
         }
 
         /// 带下一页游标的那一页：翻页这一格读的就是这一形。
-        fn paged(&self, folder_id: i64, name: &str, next_cursor: &str) -> Vec<u8> {
+        fn paged(&self, folder_id: i64, name: &str, next_cursor: &str) -> String {
             let mut payload = Harness::payload_of("children", folder_id, name);
             payload["next_cursor"] = json!(next_cursor);
             self.frame("notes_children", &payload)
@@ -519,12 +511,12 @@ mod tests {
         }
 
         /// 指定命令号的一行"办成了"：号由产品自己发出去的那一行里取。
-        fn frame(&self, cmd: &str, payload: &Value) -> Vec<u8> {
+        fn frame(&self, cmd: &str, payload: &Value) -> String {
             let line = format!(
-                "{{\"ok\":true,\"payload\":{payload},\"request_id\":\"{}\"}}\n",
+                "{{\"ok\":true,\"payload\":{payload},\"request_id\":\"{}\"}}",
                 self.id_of(cmd)
             );
-            line.into_bytes()
+            line
         }
 
         fn reply(&mut self, cmd: &str, payload: Value, at: u64) -> Vec<LinkEvent> {
@@ -599,7 +591,10 @@ mod tests {
         assert_eq!(at.read(&stale, 2), none_events());
         assert_eq!(at.link.cache().len(), 0, "被挤掉那一趟的答复落进了缓存");
         // 那一行带的确实是产品问出去的号，否则上面的"没落"是白测。
-        assert!(stale.ends_with(format!("\"{roots_id}\"}}\n").as_bytes()));
+        assert!(
+            stale.ends_with(format!("\"{roots_id}\"}}").as_str()),
+            "那一行没带上问出去的号"
+        );
 
         let frame = at.page("children", 3, "标题");
         assert_eq!(
@@ -615,10 +610,10 @@ mod tests {
         let mut at = Harness::new();
         at.want(CacheKey::Recent, 0);
         let line = format!(
-            "{{\"ok\":false,\"request_id\":\"{}\",\"error\":{{\"field\":\"limit\",\"code\":\"bad_request\",\"message\":\"页长超了\"}}}}\n",
+            "{{\"ok\":false,\"request_id\":\"{}\",\"error\":{{\"field\":\"limit\",\"code\":\"bad_request\",\"message\":\"页长超了\"}}}}",
             at.id_of("notes_recent")
         );
-        let events = at.read(line.as_bytes(), 1);
+        let events = at.read(&line, 1);
         assert_eq!(
             events,
             vec![LinkEvent::PageFailed(
@@ -646,8 +641,8 @@ mod tests {
         );
 
         let twice = at.frame("notes_roots", &Harness::payload_of("roots", 9, "重发的那一页"));
-        let never = b"{\"ok\":true,\"payload\":{\"protocol\":1},\"request_id\":\"99-9\"}\n".to_vec();
-        for stray in [twice, never] {
+        let never = "{\"ok\":true,\"payload\":{\"protocol\":1},\"request_id\":\"99-9\"}";
+        for stray in [twice.as_str(), never] {
             assert_eq!(at.read(&stray, 2), none_events(), "同一枚号答了两次，第二次照样落了格");
         }
         assert_eq!(at.cached_name(roots()), Some("甲"));
@@ -673,7 +668,7 @@ mod tests {
         assert_eq!(at.link.cache().len(), 3);
 
         let events = at.read(
-            b"{\"event\":\"notes_changed\",\"folder\":3,\"note_id\":9,\"kind\":\"renamed\"}\n",
+            "{\"event\":\"notes_changed\",\"folder\":3,\"note_id\":9,\"kind\":\"renamed\"}",
             6,
         );
         assert_eq!(
@@ -692,11 +687,11 @@ mod tests {
 
         // 没缓存的格子不作废也不报：作废一件不存在的东西不是事件。
         assert_eq!(
-            at.read(b"{\"event\":\"notes_changed\",\"folder\":8,\"note_id\":9,\"kind\":\"deleted\"}\n", 7),
+            at.read("{\"event\":\"notes_changed\",\"folder\":8,\"note_id\":9,\"kind\":\"deleted\"}", 7),
             none_events()
         );
         assert_eq!(
-            at.read(b"{\"event\":\"status\",\"plugins\":[]}\n", 8),
+            at.read("{\"event\":\"status\",\"plugins\":[]}", 8),
             none_events()
         );
     }
@@ -782,7 +777,7 @@ mod tests {
         assert_eq!(at.link.cache().len(), 3);
 
         let events = at.read(
-            b"{\"event\":\"notes_changed\",\"folder\":7,\"note_id\":9,\"kind\":\"saved\"}\n",
+            "{\"event\":\"notes_changed\",\"folder\":7,\"note_id\":9,\"kind\":\"saved\"}",
             6,
         );
         assert_eq!(
@@ -799,27 +794,18 @@ mod tests {
         assert_eq!(at.cached_name(page(7, "abc")), None);
     }
 
-    /// 半行等下一拍；读不出一行形状的那一行结束这条链路，剩下的行不再分派。
+    /// 读不出一行形状就收束这条链路；本机没问过的号不许改动任何格子。
     #[test]
-    fn a_half_line_waits_and_a_line_that_is_not_an_answer_ends_the_link() {
+    fn a_line_that_is_not_an_answer_ends_the_link() {
         let mut at = Harness::new();
         assert_eq!(
-            at.read(b"{\"ok\":true,\"pay", 0),
+            at.read("{\"ok\":true,\"payload\":{\"items\":[]},\"request_id\":\"1-9\"}", 1),
             none_events(),
-            "没等到换行就把半行当一行交了出去"
+            "没问过的号被当成了答复"
         );
-        let tail = b"load\":{\"items\":[]},\"request_id\":\"1-9\"}\n";
-        assert_eq!(at.read(tail, 1), none_events(), "没问过的号被当成了答复");
-
         assert_eq!(
-            at.read(b"hello\n", 2),
+            at.read("hello", 2),
             vec![LinkEvent::Broken("不是合法 JSON".to_string())]
-        );
-        assert_eq!(
-            at.read(&vec![b'x'; 5 << 20], 3),
-            vec![LinkEvent::Broken(
-                "答复那一行超出自家上限，等不到换行了".to_string()
-            )]
         );
     }
 
@@ -860,9 +846,8 @@ mod tests {
         at.want(children(3), 2);
         let children_id = at.id_at(1);
         at.send(Command::ClearRecent, 3);
-        // 留半行在缓冲里，再留一行没写走的帧在门口：断线要把两者都丢掉，否则新管道的第一行会被
-        // 旧连接的字节读坏，旧连接的帧会被塞进新连接。
-        assert_eq!(at.read(b"{\"ok\":true,", 4), none_events());
+        // 门口留一行没写走的帧：断线要把它丢掉。那一条命令已经按断线报回，再写进新管道只会让新
+        // 连接答一枚没问过的号。
         assert_eq!(
             at.link.submit(Command::RemoveRecent { note_id: 1 }, 4),
             none_events()
@@ -1035,9 +1020,9 @@ mod tests {
         assert_eq!(at.link.queued(), 1);
         assert_eq!(at.asked.len(), MAX_QUEUED_COMMANDS);
 
-        let frame = format!("{{\"ok\":true,\"payload\":{{\"removed\":true}},\"request_id\":\"{first}\"}}\n");
+        let frame = format!("{{\"ok\":true,\"payload\":{{\"removed\":true}},\"request_id\":\"{first}\"}}");
         assert_eq!(
-            at.read(frame.as_bytes(), 2),
+            at.read(&frame, 2),
             vec![LinkEvent::CommandDone(Command::RemoveRecent { note_id: 1 })]
         );
         assert_eq!(at.link.queued(), 0, "腾出的格子没用来发排队那一条");
@@ -1084,9 +1069,8 @@ mod tests {
 
     impl Harness {
         /// 指定号的一行"办成了"：跨连接对账那几支要拿旧代次的号问同一格。
-        fn frame_with(request_id: &str, payload: &Value) -> Vec<u8> {
-            format!("{{\"ok\":true,\"payload\":{payload},\"request_id\":\"{request_id}\"}}\n")
-                .into_bytes()
+        fn frame_with(request_id: &str, payload: &Value) -> String {
+            format!("{{\"ok\":true,\"payload\":{payload},\"request_id\":\"{request_id}\"}}")
         }
     }
 }
